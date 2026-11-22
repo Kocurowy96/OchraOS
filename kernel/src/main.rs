@@ -87,6 +87,10 @@ extern "C" fn kmain() -> ! {
 
     log_boot_info();
 
+    arch::init();
+    info!("GDT, TSS and IDT loaded");
+    arch::exceptions::breakpoint_self_test();
+
     info!("stage 0 boot finished, halting");
     halt_forever();
 }
