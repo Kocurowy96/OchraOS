@@ -2,8 +2,8 @@
 
 //! The boot banner: Bursztyn, the OchraOS mascot (a ginger Maine Coon with a pine collar).
 
-use crate::color::{BOLD, OCHRE, PINE, RESET};
-use crate::println;
+use ochra_frame::color::{BOLD, OCHRE, PINE, RESET};
+use ochra_frame::println;
 
 /// Prints the cat and the system name.
 pub fn print() {

@@ -6,6 +6,10 @@
  * Places the kernel in the top 2 GiB of the virtual address space ("higher half"), which is
  * what the Limine boot protocol expects, and splits it into segments with separate
  * permissions so that no page is both writable and executable (W^X).
+ *
+ * The kernel is a position-independent executable (PIE): the addresses below are only the
+ * link-time ones. Limine moves the whole image by a random offset (KASLR) and fixes up every
+ * absolute address using the relocation table (.rela.dyn), found through .dynamic.
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -17,6 +21,8 @@ PHDRS
     text   PT_LOAD FLAGS(5); /* r-x */
     rodata PT_LOAD FLAGS(4); /* r-- */
     data   PT_LOAD FLAGS(6); /* rw- */
+    /* Points Limine to .dynamic, which lists the relocations. */
+    dynamic PT_DYNAMIC FLAGS(6);
 }
 
 SECTIONS
@@ -35,6 +41,13 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    /* Symbol and relocation tables used by Limine to relocate the kernel. */
+    .dynsym   : { *(.dynsym) } :rodata
+    .gnu.hash : { *(.gnu.hash) } :rodata
+    .hash     : { *(.hash) } :rodata
+    .dynstr   : { *(.dynstr) } :rodata
+    .rela.dyn : { *(.rela.dyn) } :rodata
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
     .data : {
@@ -47,6 +60,15 @@ SECTIONS
 
         *(.data .data.*)
     } :data
+
+    /* The global offset table holds absolute addresses, which relocation rewrites. */
+    .got : {
+        *(.got .got.*)
+    } :data
+
+    .dynamic : {
+        *(.dynamic)
+    } :data :dynamic
 
     .bss : {
         *(.bss .bss.*)

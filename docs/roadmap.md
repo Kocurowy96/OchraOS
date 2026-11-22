@@ -24,6 +24,26 @@ and threads.
 
 **Done when:** two kernel tasks switch on the timer interrupt.
 
+Checklist:
+- [x] `ochra-frame` crate (`frame/`) holds all low-level `unsafe`; `kernel` is
+      `#![forbid(unsafe_code)]`
+- [x] PIE kernel with KASLR; SMEP/SMAP/UMIP enabled when CPUID reports them
+- [ ] physical frame allocator (+ debug self-test)
+- [ ] own page tables: W^X, NX, guard pages under every kernel stack (IST and task stacks)
+- [ ] kernel heap with an own simple allocator, no external allocator crate (+ debug self-test)
+- [ ] interrupts: legacy PIC masked, local APIC (x2APIC, falling back to xAPIC), IRQ-safe locks
+- [ ] LAPIC timer, calibrated
+- [ ] scheduler: kernel tasks with their own stacks, context switch, round-robin on the timer
+- [ ] boot test checks that tasks A and B interleave (order only, never timing: TCG in CI is
+      not stable in time)
+
+## Stage 1.5 — SMP
+
+Start the other CPU cores (application processors), per-CPU GDT/TSS/IST and data, scheduler
+on every core.
+
+**Done when:** tasks run on more than one core in QEMU with `-smp 4`.
+
 ## Stage 2 — Linux ABI
 
 `syscall` entry with Linux numbering, ELF loader with auxv, Ring 3, signals, initramfs (cpio).

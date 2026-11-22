@@ -5,10 +5,6 @@
 [alias]
 xtask = "run --quiet --package xtask --"
 
-# The kernel always runs at the fixed address chosen in `kernel/linker.ld`, so build it as a
-# plain static executable. The target's default is position-independent code, which would
-# need a relocation step at boot for no benefit.
-# TEMPORARY: KASLR (docs/security.md) needs a position-independent kernel again; this goes
-# back to PIE at the latest in stage 1, together with paging (see docs/decisions.md).
-[target.x86_64-unknown-none]
-rustflags = ["-C", "relocation-model=static"]
+# The kernel is built as a position-independent executable (the default for the
+# x86_64-unknown-none target): Limine relocates it to a random address at every boot (KASLR,
+# `kaslr: yes` in xtask/limine.conf).

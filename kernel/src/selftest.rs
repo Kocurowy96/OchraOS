@@ -5,7 +5,7 @@
 //! They deliberately crash the kernel in a known way, so `cargo xtask test` can check that the
 //! crash is reported correctly. Such switches have no place in a kernel people actually run,
 //! so they exist only with the `selftest` feature, and that feature is refused in release
-//! builds.
+//! builds (here and in `ochra-frame`).
 //!
 //! | name          | what happens                                     |
 //! |---------------|--------------------------------------------------|
@@ -18,7 +18,7 @@ compile_error!("the `selftest` feature must never be enabled in a release build"
 /// Runs the self-test `name`. Without the `selftest` feature it only logs a warning.
 #[cfg(feature = "selftest")]
 pub fn run(name: &str) {
-    use crate::arch::exceptions;
+    use ochra_frame::arch::exceptions;
 
     log::info!("running self-test {name:?}");
     match name {

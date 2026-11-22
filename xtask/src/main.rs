@@ -4,6 +4,7 @@
 //!
 //! Everything it produces goes to `build/` in the repository root (ignored by git).
 
+mod check_unsafe;
 mod image;
 mod limine;
 mod qemu;
@@ -21,9 +22,10 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  build    build the kernel and the bootable image
-  run      boot in QEMU (UEFI via OVMF), serial output in the terminal
-  test     boot in QEMU headless and check the serial log";
+  build          build the kernel and the bootable image
+  run            boot in QEMU (UEFI via OVMF), serial output in the terminal
+  test           boot in QEMU headless and check the serial log
+  check-unsafe   fail if `unsafe` appears in code outside frame/";
 
 fn main() -> ExitCode {
     let command = std::env::args().nth(1);
@@ -31,6 +33,7 @@ fn main() -> ExitCode {
         Some("build") => build().map(|_| ()),
         Some("run") => build().and_then(|image| qemu::run(&image)),
         Some("test") => test::run(),
+        Some("check-unsafe") => check_unsafe::run(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::FAILURE;

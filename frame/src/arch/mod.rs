@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! x86-64 specific code: everything that needs inline assembly lives here.
-//!
-//! Keeping the assembly in one place makes the `unsafe` easy to find and review. It is meant
-//! to move into the dedicated low-level crate once that exists (see CLAUDE.md, rule 3).
+//! x86-64 specific code: CPU tables, exceptions, port I/O and other inline assembly.
 
+pub mod cpu;
 pub mod exceptions;
-pub mod gdt;
-pub mod idt;
-pub mod port;
+pub(crate) mod gdt;
+pub(crate) mod idt;
+pub(crate) mod port;
 
 use core::arch::asm;
 
 /// Sets up the CPU tables the kernel needs before anything else: the GDT (with the TSS) and
-/// the IDT with the exception handlers.
-pub fn init() {
+/// the IDT with the exception handlers. Then switches on the CPU protection features.
+pub fn init() -> cpu::Protections {
     gdt::init();
     idt::init();
+    cpu::enable_protections()
 }
 
 /// Stops this CPU for good.

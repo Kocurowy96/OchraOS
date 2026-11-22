@@ -32,6 +32,7 @@ const BOOT: &[&str] = &[
     "OchraOS",
     "bootloader: Limine",
     "GDT, TSS and IDT loaded",
+    "CPU protections:",
     "breakpoint (int3) at",
 ];
 
@@ -39,7 +40,7 @@ const CASES: &[Case] = &[
     Case {
         name: "boot",
         command_line: "",
-        expected: &["stage 0 boot finished, halting"],
+        expected: &["boot finished, halting"],
     },
     Case {
         name: "pagefault",
@@ -79,11 +80,13 @@ pub fn run() -> Result<()> {
     let image = build_dir()?.join("test.img");
 
     let mut failed = Vec::new();
+    let mut kernel_addresses = Vec::new();
     for case in CASES {
         image::create(&image, &kernel, &bootloader, case.command_line)?;
         step(&format!("test {}: booting", case.name));
         let log = boot(&image)?;
         std::fs::write(build_dir()?.join(format!("test-{}.log", case.name)), &log)?;
+        kernel_addresses.extend(kernel_virtual_address(&log));
 
         match check(case, &log) {
             Ok(()) => eprintln!("    ok"),
@@ -94,8 +97,20 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // KASLR: Limine picks a new random address at every boot. The chance that all boots land
+    // on the same one by accident is negligible (the offset is chosen in 4 KiB steps).
+    step("test kaslr: comparing the kernel addresses of all boots");
+    kernel_addresses.sort();
+    kernel_addresses.dedup();
+    if kernel_addresses.len() >= 2 {
+        eprintln!("    ok ({} different addresses)", kernel_addresses.len());
+    } else {
+        eprintln!("    FAILED: the kernel was loaded at the same address every time");
+        failed.push("kaslr");
+    }
+
     if failed.is_empty() {
-        step(&format!("all {} tests passed", CASES.len()));
+        step(&format!("all {} tests passed", CASES.len() + 1));
         Ok(())
     } else {
         Err(format!(
@@ -190,6 +205,15 @@ fn check(case: &Case, log: &str) -> std::result::Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The virtual address from the log line "loaded at physical …, virtual 0x…".
+fn kernel_virtual_address(log: &str) -> Option<String> {
+    let line = log
+        .lines()
+        .find(|line| line.contains("loaded at physical"))?;
+    let address = line.split("virtual ").nth(1)?;
+    Some(address.trim().to_string())
 }
 
 /// Removes ANSI escape sequences (`ESC [ … letter`), i.e. the colours.

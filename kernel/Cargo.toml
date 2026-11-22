@@ -19,12 +19,11 @@ bench = false
 [features]
 # Built-in self-tests, chosen with `test=<name>` on the kernel command line; used by
 # `cargo xtask test`. Only allowed in debug builds (see `src/selftest.rs`).
-selftest = []
+selftest = ["ochra-frame/selftest"]
 
 [dependencies]
-limine = "=0.5.0"
 log = { version = "0.4", default-features = false }
-spin = { version = "0.12", default-features = false, features = ["once", "spin_mutex"] }
+ochra-frame = { path = "../frame" }
 
 [lints]
 workspace = true

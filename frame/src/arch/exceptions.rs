@@ -30,7 +30,7 @@ use log::info;
 
 use crate::arch::halt_forever;
 use crate::color::{BOLD, RED, RESET};
-use crate::serial;
+use crate::{SHOW_ADDRESSES, serial};
 
 /// The stack contents when `handle_exception` is called, lowest address first:
 /// the registers saved by `common_entry`, then what the stub and the CPU pushed.
@@ -220,7 +220,11 @@ extern "C" fn handle_exception(frame: &ExceptionFrame) {
     if frame.vector == BREAKPOINT {
         // `int3` is only ever placed on purpose, never inside the logger, so taking the
         // COM1 lock here cannot deadlock. RIP already points past the 1-byte instruction.
-        info!("breakpoint (int3) at {:#x}, continuing", frame.rip - 1);
+        if SHOW_ADDRESSES {
+            info!("breakpoint (int3) at {:#x}, continuing", frame.rip - 1);
+        } else {
+            info!("breakpoint (int3), continuing");
+        }
         return;
     }
     report(frame);
@@ -242,7 +246,9 @@ fn report(frame: &ExceptionFrame) {
     match frame.vector {
         PAGE_FAULT => {
             let _ = writeln!(out, "  {}", PageFaultCause(frame.error_code));
-            let _ = writeln!(out, "  address  {:#018x}", read_cr2());
+            if SHOW_ADDRESSES {
+                let _ = writeln!(out, "  address  {:#018x}", read_cr2());
+            }
         }
         DOUBLE_FAULT => {
             let _ = writeln!(
@@ -254,8 +260,20 @@ fn report(frame: &ExceptionFrame) {
         _ => {}
     }
 
-    let f = frame;
-    let _ = writeln!(out, "  error    {:#x}", f.error_code);
+    let _ = writeln!(out, "  error    {:#x}", frame.error_code);
+    if SHOW_ADDRESSES {
+        print_registers(&mut out, frame);
+    } else {
+        let _ = writeln!(
+            out,
+            "  (addresses and registers are hidden in release builds: KASLR)"
+        );
+    }
+    let _ = writeln!(out, "{RED}system halted{RESET}");
+}
+
+/// Prints the saved registers. They contain kernel addresses, see [`SHOW_ADDRESSES`].
+fn print_registers(out: &mut impl Write, f: &ExceptionFrame) {
     let _ = writeln!(
         out,
         "  rip {:#018x}  cs {:#06x}  rflags {:#010x}",
@@ -287,7 +305,6 @@ fn report(frame: &ExceptionFrame) {
         "  r13 {:#018x}  r14 {:#018x}  r15 {:#018x}",
         f.r13, f.r14, f.r15
     );
-    let _ = writeln!(out, "{RED}system halted{RESET}");
 }
 
 /// Human-readable name and mnemonic of an exception vector (Intel SDM vol. 3, table 6-1).
@@ -368,7 +385,7 @@ pub fn breakpoint_self_test() {
     unsafe { asm!("int3", options(nomem, nostack)) };
 }
 
-/// Causes a page fault by writing to an unmapped address (self-test `test=pagefault`).
+/// Causes a page fault by writing to an unmapped address (kernel self-test `pagefault`).
 #[cfg(feature = "selftest")]
 pub fn trigger_page_fault() -> ! {
     // SAFETY: Limine maps nothing in the low 4 GiB for protocol revision 3, so the write
@@ -377,7 +394,7 @@ pub fn trigger_page_fault() -> ! {
     unreachable!("the write to 0xdeadbeef did not fault");
 }
 
-/// Causes a double fault the way a kernel stack overflow does (self-test `test=doublefault`):
+/// Causes a double fault the way a kernel stack overflow does (kernel self-test `doublefault`):
 /// with RSP pointing to unmapped memory, the `push` faults, and the CPU cannot push the page
 /// fault frame onto that same stack either. Only the separate IST stack saves the day.
 #[cfg(feature = "selftest")]

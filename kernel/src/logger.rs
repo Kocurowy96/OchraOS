@@ -12,8 +12,8 @@
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
-use crate::color::{GREY, OCHRE, PINE, RED, RESET, YELLOW};
-use crate::println;
+use ochra_frame::color::{GREY, OCHRE, PINE, RED, RESET, YELLOW};
+use ochra_frame::println;
 
 struct SerialLogger;
 

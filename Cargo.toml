@@ -2,7 +2,7 @@
 
 [workspace]
 resolver = "3"
-members = ["kernel", "xtask"]
+members = ["frame", "kernel", "xtask"]
 # A plain `cargo build` / `cargo test` in the repository root only touches the host tool.
 # The kernel needs `--target x86_64-unknown-none`, and `cargo xtask` passes it for us.
 default-members = ["xtask"]

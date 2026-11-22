@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+[package]
+name = "ochra-frame"
+description = "The OchraOS framekernel base: boot entry, CPU and hardware access — all low-level unsafe code"
+license = "GPL-2.0-only"
+edition.workspace = true
+version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# Bare-metal only: no test harness on the host.
+test = false
+bench = false
+
+[features]
+# Triggers for the kernel's built-in self-tests. Only allowed in debug builds.
+selftest = []
+
+[dependencies]
+limine = "=0.5.0"
+log = { version = "0.4", default-features = false }
+spin = { version = "0.12", default-features = false, features = ["once", "spin_mutex"] }
+
+[lints]
+workspace = true
