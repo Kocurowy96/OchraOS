@@ -54,6 +54,41 @@ system tree behind an "advanced" option.
 - apk and apt only inside containers (`ochra-box create debian`), never on the main `/`.
 - The installer describes modes by what they give, never by calling anyone a beginner.
 
+## Installer and live ISO
+
+OchraOS ships as a live ISO with an installer app. The boot menu offers:
+
+- **Try OchraOS** — the full desktop from the USB stick, with an Install icon on the desktop.
+- **Install OchraOS** — the installer straight away, full screen.
+
+Why live: users can check their hardware (Wi-Fi, sound, GPU) before anything is
+overwritten, which matters for a niche OS with its own drivers. It also doubles as a demo.
+
+Thanks to A/B, installing is quick: create the partitions, copy the signed system image to
+slot A, set up the bootloader and encryption — no package-by-package install. The ISO is
+larger because it carries the whole desktop; EROFS compression keeps that reasonable.
+
+The installer arrives at stage 7 (it needs the GUI). Before that, OchraOS boots from an image
+in QEMU, or on real hardware from a USB stick written with `dd`, without installation.
+
+## OS identification
+
+`/etc/os-release` identifies the system to tools such as fastfetch:
+
+```
+NAME="OchraOS"
+ID=ochraos
+ID_LIKE=arch
+PRETTY_NAME="OchraOS Hematyt (Stable 2027.1.3)"
+VERSION_ID=2027.1.3
+VERSION_CODENAME=hematyt
+LOGO=ochraos
+```
+
+`ID_LIKE=arch` makes scripts and installers that detect the distribution treat OchraOS like
+Arch (for example, they use pacman). Build metadata (build host, commit) is added as extra
+fields.
+
 ## Init and systemd compatibility
 
 `ochra-init` (Rust) is PID 1 and service manager. It implements the systemd interfaces

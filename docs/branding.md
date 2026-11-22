@@ -37,6 +37,12 @@ Three cats based on the owner's cats, each with an ochre accent.
   GitHub avatar, thumbnails). Icons at 16–32 px are hand-tuned.
 - Artwork licence: CC BY-SA 4.0.
 
+## fastfetch
+
+- The image ships a fastfetch configuration with an OchraOS logo: Bursztyn in ASCII, in ochre
+  and pine.
+- Once the project is public, submit the logo upstream to fastfetch, as other distributions do.
+
 ## Sound
 
 - First boot after installation: a longer welcome theme.
