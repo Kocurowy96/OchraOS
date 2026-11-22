@@ -31,6 +31,8 @@ Three cats based on the owner's cats, each with an ochre accent.
 | Selenit | white Devon Rex | ochre ear tips or collar | developers: Nightly, Beta, SDK, crash screens |
 | Tanzanit "Tazi" | blue British Longhair with a white bib | copper-ochre eyes | Ochra Guard: permission prompts, lock screen |
 
+- Style: **chibi** (big heads and eyes, soft shapes, blush), chosen from three concept directions
+  (geometric, chibi, line and colour blob) on 2026-11-22.
 - Source artwork is vector (SVG, made in Affinity); PNG exported where needed (bootloader,
   GitHub avatar, thumbnails). Icons at 16–32 px are hand-tuned.
 - Artwork licence: CC BY-SA 4.0.
