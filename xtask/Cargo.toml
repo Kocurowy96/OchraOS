@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "xtask"
+description = "Build, run and test helper for OchraOS (`cargo xtask <cmd>`)"
+license = "MIT OR Apache-2.0"
+edition.workspace = true
+version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
