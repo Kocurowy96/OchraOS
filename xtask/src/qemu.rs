@@ -39,8 +39,8 @@ pub fn run(image: &Path) -> Result<()> {
     crate::run(&mut qemu)
 }
 
-/// The QEMU command line shared by `run` and (later) `test`.
-fn command(image: &Path) -> Result<Command> {
+/// The QEMU command line shared by `run` and `test`.
+pub fn command(image: &Path) -> Result<Command> {
     let (code, vars) = find_ovmf()?;
     let vars_copy = image.with_file_name("ovmf-vars.fd");
     std::fs::copy(&vars, &vars_copy)?;

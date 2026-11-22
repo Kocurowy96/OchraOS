@@ -7,6 +7,7 @@
 mod image;
 mod limine;
 mod qemu;
+mod test;
 
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -29,7 +30,7 @@ fn main() -> ExitCode {
     let result = match command.as_deref() {
         Some("build") => build().map(|_| ()),
         Some("run") => build().and_then(|image| qemu::run(&image)),
-        Some("test") => Err("not implemented yet".into()),
+        Some("test") => test::run(),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::FAILURE;
@@ -44,29 +45,41 @@ fn main() -> ExitCode {
     }
 }
 
-/// Builds the kernel, Limine and the boot image. Returns the path of the image.
+/// Builds the kernel, Limine and the boot image `build/ochraos.img`. Returns the image path.
 fn build() -> Result<PathBuf> {
-    let build_dir = root().join("build");
-    std::fs::create_dir_all(&build_dir)?;
-
-    let kernel = build_kernel()?;
-    let bootloader = limine::build(&build_dir)?;
-    image::create(&build_dir, &kernel, &bootloader)
+    let kernel = build_kernel(&[])?;
+    let bootloader = limine::build(&build_dir()?)?;
+    let image = build_dir()?.join("ochraos.img");
+    image::create(&image, &kernel, &bootloader, "")?;
+    Ok(image)
 }
 
-/// Compiles the kernel crate for bare metal and returns the path of the ELF file.
-fn build_kernel() -> Result<PathBuf> {
+/// Compiles the kernel crate for bare metal (debug profile) with the given cargo features
+/// and returns the path of the ELF file.
+fn build_kernel(features: &[&str]) -> Result<PathBuf> {
     step("building the kernel");
     // `cargo xtask` runs under cargo, which tells us which cargo binary it is.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    run(Command::new(cargo).current_dir(root()).args([
+    let mut command = Command::new(cargo);
+    command.current_dir(root()).args([
         "build",
         "--package",
         "kernel",
         "--target",
         "x86_64-unknown-none",
-    ]))?;
+    ]);
+    if !features.is_empty() {
+        command.arg("--features").arg(features.join(","));
+    }
+    run(&mut command)?;
     Ok(root().join("target/x86_64-unknown-none/debug/kernel"))
+}
+
+/// `build/` in the repository root, created if needed.
+fn build_dir() -> Result<PathBuf> {
+    let dir = root().join("build");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// The repository root (the parent of the `xtask/` directory).

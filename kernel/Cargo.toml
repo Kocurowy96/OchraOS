@@ -16,6 +16,11 @@ name = "kernel"
 test = false
 bench = false
 
+[features]
+# Built-in self-tests, chosen with `test=<name>` on the kernel command line; used by
+# `cargo xtask test`. Only allowed in debug builds (see `src/selftest.rs`).
+selftest = []
+
 [dependencies]
 limine = "=0.5.0"
 log = { version = "0.4", default-features = false }

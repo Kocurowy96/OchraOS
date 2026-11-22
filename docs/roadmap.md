@@ -10,11 +10,11 @@ Rust `no_std` kernel, Limine bootloader (UEFI), QEMU, serial logging, `cargo xta
 port; CI boots it headless and checks the log.
 
 Checklist:
-- [ ] `rust-toolchain.toml`, workspace, target `x86_64-unknown-none`
-- [ ] Limine boot in QEMU with OVMF
-- [ ] serial logger (COM1), coloured output (ochre `#CC7722`, pine `#047857`)
-- [ ] GDT, IDT, readable exception handlers (page fault, double fault)
-- [ ] `cargo xtask build|run|test`
+- [x] `rust-toolchain.toml`, workspace, target `x86_64-unknown-none`
+- [x] Limine boot in QEMU with OVMF
+- [x] serial logger (COM1), coloured output (ochre `#CC7722`, pine `#047857`)
+- [x] GDT, IDT, readable exception handlers (page fault, double fault)
+- [x] `cargo xtask build|run|test`
 - [ ] GitHub Actions: fmt, clippy, build, headless boot test
 
 ## Stage 1 — Core

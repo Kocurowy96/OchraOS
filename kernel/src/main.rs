@@ -11,6 +11,7 @@ mod arch;
 mod banner;
 mod color;
 mod logger;
+mod selftest;
 mod serial;
 
 use core::fmt::Write;
@@ -19,8 +20,8 @@ use core::panic::PanicInfo;
 use limine::BaseRevision;
 use limine::memory_map::EntryType;
 use limine::request::{
-    BootloaderInfoRequest, ExecutableAddressRequest, HhdmRequest, MemoryMapRequest,
-    RequestsEndMarker, RequestsStartMarker,
+    BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
+    MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
 };
 use log::{debug, error, info, trace};
 
@@ -43,6 +44,11 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static BOOTLOADER_INFO: BootloaderInfoRequest = BootloaderInfoRequest::new();
+
+/// The kernel command line (`cmdline:` in `limine.conf`).
+#[used]
+#[unsafe(link_section = ".requests")]
+static COMMAND_LINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 
 /// The physical memory map: which RAM is free, reserved, used by the kernel…
 #[used]
@@ -86,13 +92,31 @@ extern "C" fn kmain() -> ! {
     }
 
     log_boot_info();
+    let command_line = command_line();
+    info!("command line: \"{command_line}\"");
 
     arch::init();
     info!("GDT, TSS and IDT loaded");
     arch::exceptions::breakpoint_self_test();
 
+    // `test=<name>` runs one of the built-in self-tests (see `selftest.rs`).
+    if let Some(test) = command_line
+        .split_whitespace()
+        .find_map(|argument| argument.strip_prefix("test="))
+    {
+        selftest::run(test);
+    }
+
     info!("stage 0 boot finished, halting");
     halt_forever();
+}
+
+/// The kernel command line, or an empty string if there is none (or it is not UTF-8).
+fn command_line() -> &'static str {
+    COMMAND_LINE
+        .get_response()
+        .and_then(|response| response.cmdline().to_str().ok())
+        .unwrap_or("")
 }
 
 /// Logs what Limine told us about the machine.

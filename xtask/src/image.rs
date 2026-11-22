@@ -10,7 +10,7 @@
 //! image file directly, without mounting it and without root.
 
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crate::{Result, root, run, step};
@@ -18,16 +18,15 @@ use crate::{Result, root, run, step};
 /// 64 MiB: comfortably above the FAT32 minimum (about 33 MiB) and plenty for stage 0.
 const IMAGE_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Writes `build/ochraos.img` and returns its path.
-pub fn create(build_dir: &Path, kernel: &Path, bootloader: &Path) -> Result<PathBuf> {
-    step("creating the boot image");
-    let image = build_dir.join("ochraos.img");
+/// Writes the boot image to `image`. A non-empty `command_line` is passed to the kernel.
+pub fn create(image: &Path, kernel: &Path, bootloader: &Path, command_line: &str) -> Result<()> {
+    step(&format!("creating the boot image {}", image.display()));
     // Start from an empty (all zero) file each time, so no stale files survive.
-    File::create(&image)?.set_len(IMAGE_SIZE)?;
+    File::create(image)?.set_len(IMAGE_SIZE)?;
 
     let mtools = |tool: &str| {
         let mut command = Command::new(tool);
-        command.arg("-i").arg(&image);
+        command.arg("-i").arg(image);
         command
     };
 
@@ -37,10 +36,21 @@ pub fn create(build_dir: &Path, kernel: &Path, bootloader: &Path) -> Result<Path
     run(mtools("mcopy")
         .arg(bootloader)
         .arg("::/EFI/BOOT/BOOTX64.EFI"))?;
+    let config = image.with_extension("limine.conf");
+    std::fs::write(&config, limine_config(command_line)?)?;
     run(mtools("mcopy")
-        .arg(root().join("xtask/limine.conf"))
+        .arg(&config)
         .arg("::/boot/limine/limine.conf"))?;
     run(mtools("mcopy").arg(kernel).arg("::/boot/kernel"))?;
 
-    Ok(image)
+    Ok(())
+}
+
+/// `xtask/limine.conf`, plus a `cmdline:` line for the (only) boot entry if needed.
+fn limine_config(command_line: &str) -> Result<String> {
+    let mut config = std::fs::read_to_string(root().join("xtask/limine.conf"))?;
+    if !command_line.is_empty() {
+        config.push_str(&format!("    cmdline: {command_line}\n"));
+    }
+    Ok(config)
 }
