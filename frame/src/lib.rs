@@ -16,6 +16,9 @@
 
 #![no_std]
 
+// `Arc` for tasks; the heap is in `mm::heap`.
+extern crate alloc;
+
 #[cfg(all(feature = "selftest", not(debug_assertions)))]
 compile_error!("the `selftest` feature must never be enabled in a release build");
 
@@ -28,6 +31,7 @@ mod panic;
 pub mod selftest;
 pub mod serial;
 pub mod sync;
+pub mod task;
 
 pub use boot::BootInfo;
 

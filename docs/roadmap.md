@@ -17,7 +17,7 @@ Checklist:
 - [x] `cargo xtask build|run|test`
 - [x] GitHub Actions: fmt, clippy, build, headless boot test
 
-## Stage 1 — Core
+## Stage 1 — Core ✅
 
 Paging, physical frame allocator, kernel heap, interrupts, APIC, timer, scheduler, processes
 and threads.
@@ -34,8 +34,8 @@ Checklist:
 - [x] kernel heap with an own simple allocator, no external allocator crate (+ debug self-test)
 - [x] interrupts: legacy PIC masked, local APIC (x2APIC, falling back to xAPIC), IRQ-safe locks
 - [x] LAPIC timer, calibrated
-- [ ] scheduler: kernel tasks with their own stacks, context switch, round-robin on the timer
-- [ ] boot test checks that tasks A and B interleave (order only, never timing: TCG in CI is
+- [x] scheduler: kernel tasks with their own stacks, context switch, round-robin on the timer
+- [x] boot test checks that tasks A and B interleave (order only, never timing: TCG in CI is
       not stable in time)
 
 ## Stage 1.5 — SMP

@@ -54,7 +54,7 @@ const CASES: &[Case] = &[
         name: "boot",
         command_line: "",
         qemu_args: &[],
-        expected: &["boot finished, halting"],
+        expected: &["boot finished, idling"],
         anywhere: &[],
     },
     Case {
@@ -136,12 +136,23 @@ const CASES: &[Case] = &[
         ],
         anywhere: &[],
     },
+    // A task overflows its stack into the guard page.
+    Case {
+        name: "taskstack",
+        command_line: "test=taskstack",
+        qemu_args: &[],
+        expected: &[
+            "CPU EXCEPTION: Double fault (#DF, vector 8)",
+            "system halted",
+        ],
+        anywhere: &[],
+    },
     // The same boot on a CPU without x2APIC, so the xAPIC (memory-mapped) path is tested too.
     Case {
         name: "xapic",
         command_line: "",
         qemu_args: &["-cpu", "max,-x2apic"],
-        expected: &["boot finished, halting"],
+        expected: &["boot finished, idling"],
         anywhere: &["local APIC in xAPIC mode"],
     },
 ];
@@ -150,7 +161,7 @@ const CASES: &[Case] = &[
 const FORBIDDEN: &[&str] = &["KERNEL PANIC", "CPU EXCEPTION", "ERROR"];
 
 /// After one of these lines the kernel prints nothing more (except, for a panic, the message).
-const FINAL_LINES: &[&str] = &["halting", "system halted", "KERNEL PANIC"];
+const FINAL_LINES: &[&str] = &["idling", "system halted", "KERNEL PANIC"];
 
 /// Generous, so the test also passes without KVM (plain emulation on CI runners).
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -165,12 +176,16 @@ pub fn run() -> Result<()> {
 
     let mut failed = Vec::new();
     let mut kernel_addresses = Vec::new();
+    let mut boot_log = String::new();
     for case in CASES {
         image::create(&image, &kernel, &bootloader, case.command_line)?;
         step(&format!("test {}: booting", case.name));
         let log = boot(&image, case.qemu_args)?;
         std::fs::write(build_dir()?.join(format!("test-{}.log", case.name)), &log)?;
         kernel_addresses.extend(kernel_virtual_address(&log));
+        if case.name == "boot" {
+            boot_log = log.clone();
+        }
 
         match check(case, &log) {
             Ok(()) => eprintln!("    ok"),
@@ -193,8 +208,17 @@ pub fn run() -> Result<()> {
         failed.push("kaslr");
     }
 
+    step("test scheduler: tasks A and B take turns");
+    match check_interleaving(&boot_log) {
+        Ok(switches) => eprintln!("    ok ({switches} switches between A and B)"),
+        Err(problem) => {
+            eprintln!("    FAILED: {problem}");
+            failed.push("scheduler");
+        }
+    }
+
     if failed.is_empty() {
-        step(&format!("all {} tests passed", CASES.len() + 1));
+        step(&format!("all {} tests passed", CASES.len() + 2));
         Ok(())
     } else {
         Err(format!(
@@ -296,6 +320,31 @@ fn check(case: &Case, log: &str) -> std::result::Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Checks that the steps of tasks A and B interleave: only their order counts, never timing.
+/// Each task waits for a timer tick after every step, so with round-robin switching on every
+/// tick they alternate; we only require more switches than running one after the other would
+/// give (1), so an occasional double step on a slow machine still passes.
+fn check_interleaving(log: &str) -> std::result::Result<usize, String> {
+    let tasks: Vec<char> = log
+        .lines()
+        .filter_map(|line| line.split("task ").nth(1))
+        .filter_map(|rest| rest.strip_suffix(" of 5").and(rest.chars().next()))
+        .collect();
+    for name in ['A', 'B'] {
+        let steps = tasks.iter().filter(|&&task| task == name).count();
+        if steps != 5 {
+            return Err(format!("task {name} logged {steps} of 5 steps"));
+        }
+    }
+    let switches = tasks.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    if switches < 4 {
+        return Err(format!(
+            "only {switches} switches between A and B: {tasks:?}"
+        ));
+    }
+    Ok(switches)
 }
 
 /// The virtual address from the log line "loaded at physical …, virtual 0x…".

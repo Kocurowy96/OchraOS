@@ -18,7 +18,8 @@ through this project. So:
 
 ## Current stage
 
-**Stage 1 — Core.** See `docs/roadmap.md`. (Stage 0 done: CI green on `a97b643`.)
+**Stage 1.5 — SMP.** See `docs/roadmap.md`. (Stage 0 done: CI green on `a97b643`; stage 1
+done: tag `stage-1`.)
 Do not start work that belongs to a later stage unless the owner asks for it.
 
 ## Working mode (from stage 1)

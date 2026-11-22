@@ -4,6 +4,9 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | Scheduling split: the mechanism (task stacks with guard pages, context switch, current task) in `ochra_frame::task`, the policy (round-robin run queue, switch on every timer tick) in the safe `kernel` crate | the policy can change without new `unsafe`; the context switch saves only callee-saved registers, the interrupt path saves the rest |
+| 2026-11-22 | End-of-interrupt is sent before the interrupt handler runs (interrupts stay off until `iretq`) | a handler may switch tasks and not return for a while; the APIC must not wait for it |
+| 2026-11-22 | After boot the kernel only runs tasks: an `idle` task (`sti; hlt` loop) replaces halting; tasks do not exit yet | the boot stack (no guard page) is left for good; task exit comes with processes in stage 2 |
 | 2026-11-22 | Interrupts: legacy PIC remapped to 32–47 and masked; local APIC in x2APIC mode, xAPIC (MMIO, uncached mapping in PML4 slot 510) as fallback; timer vector 0x30, spurious 0xFF; all `frame` locks are `IrqMutex` (interrupts off while held) | modern interrupt path only; no same-CPU deadlock between a lock holder and an interrupt handler |
 | 2026-11-22 | Timer: LAPIC timer in periodic mode at 100 Hz, calibrated over 10 ms with PIT channel 2 | the PIT has a known frequency on every PC; 10 ms is a reasonable first time slice; TSC-deadline can replace it later |
 | 2026-11-22 | Kernel heap: own first-fit free list sorted by address, merging neighbours, 16-byte granularity, in PML4 slot 508, grows on demand; no allocator crate | simple to read and verify; size classes can come later if profiling asks for them |

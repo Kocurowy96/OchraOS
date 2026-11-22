@@ -17,6 +17,7 @@ extern crate alloc;
 
 mod banner;
 mod logger;
+mod sched;
 mod selftest;
 mod time;
 
@@ -87,11 +88,25 @@ fn main(boot: &'static BootInfo) -> ! {
         selftest::run(test);
     }
 
+    // From here on the kernel runs as tasks, each on its own stack with a guard page; the
+    // boot stack (Limine's) is left behind.
+    selftest::spawn_tasks();
+    sched::spawn("idle", idle);
+    sched::start();
+}
+
+/// Runs when no other task has work: sleeps until the next interrupt.
+fn idle() -> ! {
+    while !selftest::tasks_finished() {
+        interrupts::wait();
+    }
     info!(
-        "boot finished, halting ({} timer ticks so far)",
+        "boot finished, idling ({} timer ticks so far)",
         time::ticks()
     );
-    arch::halt_forever();
+    loop {
+        interrupts::wait();
+    }
 }
 
 /// Logs what the bootloader told us about the machine.

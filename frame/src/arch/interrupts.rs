@@ -17,8 +17,8 @@ use super::exceptions::{self, ExceptionFrame};
 /// First vector used for interrupts; 0–31 are CPU exceptions.
 pub const FIRST_VECTOR: u8 = 32;
 
-/// A handler for one interrupt vector. It runs with interrupts off; the end-of-interrupt
-/// signal to the local APIC is sent after it returns.
+/// A handler for one interrupt vector. It runs with interrupts off. The end-of-interrupt
+/// signal has already been sent, so the handler may switch tasks (the timer handler does).
 pub type Handler = fn(vector: u8);
 
 /// Registered handlers, as `fn` pointers stored as integers (0 = none). Atomics, so a handler
@@ -41,6 +41,10 @@ pub(super) fn dispatch(frame: &ExceptionFrame) {
         // A spurious interrupt is not a real one: no handler, and no end-of-interrupt.
         return;
     }
+    // End of interrupt *before* the handler: if the handler switches to another task, this
+    // one may not continue for a while, and the APIC must not wait for it meanwhile. With
+    // interrupts off until `iretq`, no new interrupt can nest here anyway.
+    apic::end_of_interrupt();
     let handler = HANDLERS[usize::from(vector)].load(Ordering::Acquire);
     if handler != 0 {
         // SAFETY: the only non-zero values ever stored are `Handler` function pointers
@@ -50,7 +54,6 @@ pub(super) fn dispatch(frame: &ExceptionFrame) {
     } else {
         log::warn!("interrupt on vector {vector} without a handler");
     }
-    apic::end_of_interrupt();
 }
 
 /// Turns interrupts on for this CPU.

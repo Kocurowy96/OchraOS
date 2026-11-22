@@ -35,8 +35,26 @@ pub fn run(name: &str) {
         "guardpage" => crash::stack_guard_page(),
         "smep" => crash::smep(),
         "smap" => crash::smap(),
+        // Runs as a task once the scheduler starts.
+        "taskstack" => crate::sched::spawn("overflow", overflow_task_stack),
         _ => log::error!("unknown self-test {name:?}"),
     }
+}
+
+/// Recurses until the task's stack runs into its guard page. The page fault handler then
+/// has no stack to run on either, so the CPU raises a double fault, which has its own stack.
+#[cfg(feature = "selftest")]
+fn overflow_task_stack() -> ! {
+    fn recurse(depth: u64) -> u64 {
+        // A way out the compiler cannot see through, so it keeps the recursion.
+        if core::hint::black_box(depth) == u64::MAX {
+            return 0;
+        }
+        let buffer = core::hint::black_box([depth; 64]);
+        recurse(depth + 1).wrapping_add(buffer[0])
+    }
+    recurse(0);
+    unreachable!("the task stack never overflowed");
 }
 
 /// Runs the self-test `name`. Without the `selftest` feature it only logs a warning.
@@ -250,4 +268,50 @@ fn check_timer() {
     let seen = crate::time::ticks() - start;
     assert!(seen >= 5, "self-test timer: only {seen} ticks");
     log::info!("self-test timer: ok ({seen} ticks)");
+}
+
+/// Steps each scheduler test task takes.
+#[cfg(feature = "selftest")]
+const TASK_STEPS: u32 = 5;
+#[cfg(feature = "selftest")]
+static TASKS_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Scheduler: two tasks, A and B, each log a few steps and wait for the timer in between. If
+/// the timer switches tasks, their lines interleave; `cargo xtask test` checks that order
+/// (never how long anything takes).
+#[cfg(feature = "selftest")]
+pub fn spawn_tasks() {
+    fn steps(name: &str) {
+        for step in 1..=TASK_STEPS {
+            log::info!("task {name}: step {step} of {TASK_STEPS}");
+            ochra_frame::arch::interrupts::wait();
+        }
+        TASKS_DONE.fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+    fn task_a() -> ! {
+        steps("A");
+        loop {
+            ochra_frame::arch::interrupts::wait();
+        }
+    }
+    fn task_b() -> ! {
+        steps("B");
+        loop {
+            ochra_frame::arch::interrupts::wait();
+        }
+    }
+    crate::sched::spawn("A", task_a);
+    crate::sched::spawn("B", task_b);
+}
+
+/// Without self-tests there are no test tasks.
+#[cfg(not(feature = "selftest"))]
+pub fn spawn_tasks() {}
+
+/// Whether the tasks from [`spawn_tasks`] are done.
+pub fn tasks_finished() -> bool {
+    #[cfg(feature = "selftest")]
+    return TASKS_DONE.load(core::sync::atomic::Ordering::Acquire) == 2;
+    #[cfg(not(feature = "selftest"))]
+    true
 }
