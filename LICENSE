@@ -1,0 +1,11 @@
+OchraOS is distributed under several licences. Each source file states its licence in an
+SPDX header; the full licence texts are in the LICENSES/ directory.
+
+- Kernel (kernel/ and everything linked into it): GPL-2.0-only
+  LICENSES/GPL-2.0-only.txt
+- Userspace components and tools: MIT OR Apache-2.0, at your option
+  LICENSES/MIT.txt, LICENSES/Apache-2.0.txt
+- Artwork (mascots, wallpapers, icons, sounds): CC-BY-SA-4.0
+  LICENSES/CC-BY-SA-4.0.txt
+
+Copyright (c) 2026 Kocurowy96 and OchraOS contributors.

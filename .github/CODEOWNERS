@@ -1,0 +1,7 @@
+# Every change needs review by the maintainer.
+*                   @Kocurowy96
+
+# Security-critical areas (two-person review once there are more maintainers).
+/.github/           @Kocurowy96
+/xtask/             @Kocurowy96
+/docs/security.md   @Kocurowy96

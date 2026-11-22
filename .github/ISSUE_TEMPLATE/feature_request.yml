@@ -1,0 +1,29 @@
+name: Feature request
+description: An idea for OchraOS
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: checkboxes
+    id: principles
+    attributes:
+      label: Fits the project principles
+      description: See docs/architecture.md → Principles
+      options:
+        - label: Keeps OchraOS lightweight (or is optional and off by default)
+        - label: Does not weaken security or privacy
