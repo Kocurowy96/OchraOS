@@ -16,6 +16,11 @@
 //!
 //! Every task stack is a [`KernelStack`] with a guard page below it.
 //!
+//! The x87/SSE registers (floating point and vectors) are not callee-saved: user programs
+//! use them freely, and the switch can happen in the middle of their use (a timer tick). So
+//! every switch also saves them with `fxsave` into the task's [`FpuState`] and loads the next
+//! task's with `fxrstor`. The kernel itself never uses these registers.
+//!
 //! With several CPUs, a task put back into the run queue can be picked by another CPU while
 //! the old one is still saving it. So every task has an `on_cpu` flag (as in Linux): it is set
 //! by the CPU that switches to the task, and cleared by [`switch`] only once the task's state
@@ -23,11 +28,12 @@
 //! the task.
 
 use alloc::sync::Arc;
+use core::any::Any;
 use core::arch::naked_asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::arch::interrupts;
+use crate::arch::{cpu, interrupts};
 use crate::cpu_local;
 use crate::mm::paging::{self, KernelStack};
 use crate::mm::user::UserSpace;
@@ -42,6 +48,8 @@ pub struct Task {
     name: &'static str,
     /// Saved stack pointer while the task is not running.
     saved_rsp: UnsafeCell<u64>,
+    /// Saved x87/SSE registers while the task is not running.
+    fpu: UnsafeCell<FpuState>,
     /// A CPU runs this task, or is still saving it (see the module documentation).
     on_cpu: AtomicBool,
     /// The user address space this task runs in; `None` for kernel-only tasks, which run on
@@ -49,11 +57,31 @@ pub struct Task {
     space: Option<Arc<UserSpace>>,
     /// For a user task: where it starts in user mode (instruction and stack pointer).
     user_start: Option<(u64, u64)>,
+    /// The FS segment base of a user task: the thread pointer (TLS), set with `arch_prctl`.
+    /// Loaded into the FS base MSR whenever the task is switched to.
+    fs_base: AtomicU64,
+    /// What the kernel keeps about the task (its process), opaque to `ochra-frame`.
+    data: Option<Arc<dyn Any + Send + Sync>>,
     /// Owned so it lives as long as the task.
     _stack: KernelStack,
 }
 
-// SAFETY: `saved_rsp` is only accessed by `switch_to` and `start`, with interrupts off: written
+/// The 512-byte area `fxsave` writes and `fxrstor` reads; it must be 16-byte aligned.
+#[repr(C, align(16))]
+struct FpuState([u8; 512]);
+
+impl FpuState {
+    /// The state a new program starts with, as on Linux: all registers zero, x87 control word
+    /// 0x037F and MXCSR 0x1F80 (every floating point exception masked, round to nearest).
+    fn initial() -> Self {
+        let mut state = [0; 512];
+        state[0..2].copy_from_slice(&0x037F_u16.to_le_bytes());
+        state[24..28].copy_from_slice(&0x1F80_u32.to_le_bytes());
+        Self(state)
+    }
+}
+
+// SAFETY: `saved_rsp` (and `fpu`) is only accessed by `switch_to` and `start`, with interrupts off: written
 // by `switch` on the CPU leaving the task, and read by a CPU that has claimed the task through
 // `on_cpu`, which happens only after the writer cleared it (release/acquire). So at most one
 // CPU touches it at a time. Everything else in `Task` is atomic or immutable.
@@ -69,6 +97,38 @@ impl Task {
     pub fn name(&self) -> &'static str {
         self.name
     }
+
+    /// The kernel's data for this task, given to [`spawn_user`].
+    pub fn data(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        self.data.as_ref()
+    }
+
+    pub fn fs_base(&self) -> u64 {
+        self.fs_base.load(Ordering::Relaxed)
+    }
+}
+
+/// Model-specific register holding the FS segment base.
+const FS_BASE_MSR: u32 = 0xC000_0100;
+
+/// Sets the current task's FS base (its thread pointer), now and on every later switch to
+/// it. Fails for an address outside the user half: a kernel address there would let user
+/// code reach kernel memory through `fs:` (with SMAP off), and a non-canonical one would
+/// fault in the kernel when loaded.
+pub fn set_fs_base(value: u64) -> Result<(), crate::user_mode::BadAddress> {
+    if value >= crate::mm::user::USER_END {
+        return Err(crate::user_mode::BadAddress);
+    }
+    let were_enabled = interrupts::disable();
+    let task = current_slot().lock().clone().expect("a task is running");
+    task.fs_base.store(value, Ordering::Relaxed);
+    // SAFETY: a canonical user address in FS base only affects `fs:` accesses, which the
+    // kernel never makes.
+    unsafe { cpu::write_msr(FS_BASE_MSR, value) };
+    if were_enabled {
+        interrupts::enable();
+    }
+    Ok(())
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -80,14 +140,27 @@ pub fn spawn(name: &'static str, entry: fn() -> !) -> Arc<Task> {
 }
 
 /// Creates a user task: it runs in `space` and starts in user mode at `entry` with the stack
-/// pointer `stack`. Its kernel stack serves its syscalls and interrupts.
-pub fn spawn_user(name: &'static str, space: Arc<UserSpace>, entry: u64, stack: u64) -> Arc<Task> {
-    create(name, start_user_task, Some(space), Some((entry, stack)))
+/// pointer `stack`. Its kernel stack serves its syscalls and interrupts. `data` is the
+/// kernel's own record of the task, returned by [`Task::data`].
+pub fn spawn_user(
+    name: &'static str,
+    space: Arc<UserSpace>,
+    entry: u64,
+    stack: u64,
+    data: Option<Arc<dyn Any + Send + Sync>>,
+) -> Arc<Task> {
+    create(
+        name,
+        start_user_task,
+        Some(space),
+        Some((entry, stack)),
+        data,
+    )
 }
 
 /// Like [`spawn`], but the task runs with `space` loaded in CR3.
 pub fn spawn_in(name: &'static str, entry: fn() -> !, space: Option<Arc<UserSpace>>) -> Arc<Task> {
-    create(name, entry, space, None)
+    create(name, entry, space, None, None)
 }
 
 /// First code of a user task, on its kernel stack: off to user mode.
@@ -103,6 +176,7 @@ fn create(
     entry: fn() -> !,
     space: Option<Arc<UserSpace>>,
     user_start: Option<(u64, u64)>,
+    data: Option<Arc<dyn Any + Send + Sync>>,
 ) -> Arc<Task> {
     let stack = KernelStack::new(STACK_PAGES);
     // The first switch to the task "returns" into `task_trampoline`, popping six zeroed
@@ -126,9 +200,12 @@ fn create(
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         name,
         saved_rsp: UnsafeCell::new(rsp),
+        fpu: UnsafeCell::new(FpuState::initial()),
         on_cpu: AtomicBool::new(false),
         space,
         user_start,
+        fs_base: AtomicU64::new(0),
+        data,
         _stack: stack,
     })
 }
@@ -149,7 +226,10 @@ pub fn start(first: Arc<Task>) -> ! {
     claim(&first);
     // SAFETY: `first` is claimed by this CPU, so its saved stack pointer is stable.
     let next_rsp = unsafe { *first.saved_rsp.get() };
+    // SAFETY: as above, the claimed task's FPU state is ours to load.
+    unsafe { load_fpu(first.fpu.get()) };
     load_space(first.space.as_deref());
+    load_fs_base(&first);
     cpu_local::set_kernel_stack(first._stack.top());
     *current_slot().lock() = Some(first);
     // The boot stack's context and flag are throw-away variables: nothing ever switches back.
@@ -176,9 +256,14 @@ pub fn switch_to(next: Arc<Task>) {
         return;
     }
     let previous_rsp = previous.saved_rsp.get();
+    // SAFETY: `previous` is the task running on this CPU (still claimed: its `on_cpu` is only
+    // cleared by `switch` below), so nothing else touches its FPU state.
+    unsafe { save_fpu(previous.fpu.get()) };
     claim(&next);
     // SAFETY: `next` is claimed by this CPU, so its saved stack pointer is stable.
     let next_rsp = unsafe { *next.saved_rsp.get() };
+    // SAFETY: as above, the claimed task's FPU state is ours to load.
+    unsafe { load_fpu(next.fpu.get()) };
     let same_space = match (&previous.space, &next.space) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
@@ -190,6 +275,7 @@ pub fn switch_to(next: Arc<Task>) {
             space.note_unloaded();
         }
     }
+    load_fs_base(&next);
     cpu_local::set_kernel_stack(next._stack.top());
     // The per-CPU current task keeps `next` alive; `previous` stays alive in this stack frame while
     // suspended, and the scheduler's queue holds it too.
@@ -219,6 +305,34 @@ fn load_space(space: Option<&UserSpace>) {
     // SAFETY: every address space maps the kernel half (shared with the kernel's tables), and
     // the code and stack running now are in the kernel half.
     unsafe { paging::write_cr3(root) };
+}
+
+/// # Safety
+///
+/// `state` must be valid for writes, and no other CPU may access it.
+unsafe fn save_fpu(state: *mut FpuState) {
+    // SAFETY: `state` is a valid, 16-byte aligned 512-byte area (the caller and `FpuState`).
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) state, options(nostack, preserves_flags)) };
+}
+
+/// # Safety
+///
+/// `state` must hold a state written by `fxsave` or [`FpuState::initial`], and no other CPU
+/// may write to it.
+unsafe fn load_fpu(state: *const FpuState) {
+    // SAFETY: as above; an invalid MXCSR would raise #GP, but the state comes from `fxsave` or
+    // from `initial`, whose MXCSR is valid.
+    unsafe {
+        core::arch::asm!("fxrstor64 [{}]", in(reg) state, options(nostack, preserves_flags, readonly))
+    };
+}
+
+/// Gives a user task its own FS base back. (Kernel tasks do not use FS.)
+fn load_fs_base(task: &Task) {
+    if task.user_start.is_some() {
+        // SAFETY: `fs_base` only ever holds user addresses (`set_fs_base`); see there.
+        unsafe { cpu::write_msr(FS_BASE_MSR, task.fs_base()) };
+    }
 }
 
 /// Marks `task` as running on this CPU, first waiting until the CPU that ran it before has

@@ -24,6 +24,7 @@ pub fn init() -> cpu::Protections {
     gdt::init();
     idt::init();
     syscall::init();
+    cpu::enable_sse();
     cpu::enable_protections()
 }
 
@@ -34,6 +35,7 @@ pub(crate) fn init_ap() -> (cpu::Protections, &'static gdt::CpuTables) {
     let tables = gdt::init_ap(double_fault_stack.top());
     idt::load();
     syscall::init();
+    cpu::enable_sse();
     (cpu::enable_protections(), tables)
 }
 

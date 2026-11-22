@@ -67,12 +67,16 @@ Checklist:
 - [x] P1: per-process address spaces with TLB shootdown; ring 3 and the `syscall` entry
       (`swapgs`, `TSS.RSP0`, `sysret` hardening); `copy_from_user`/`copy_to_user` with SMAP
       and exception fixup (`EFAULT`, never a panic); syscall table with Linux numbers
-- [ ] P2: initramfs (cpio, Limine module), ELF loader with auxv, `brk`/`mmap`/`munmap`/
+- [x] P2: initramfs (cpio, Limine module), ELF loader with auxv, `brk`/`mmap`/`munmap`/
       `mprotect`, TLS, ChaCha20 CSPRNG in `frame` (seeded from RDRAND, RDSEED and the TSC,
       with CPUID and sanity checks) for `AT_RANDOM`, ASLR and `getrandom`; musl "hello"
 - [ ] P3: wait queues, blocking and wake-up from another CPU, task exit; processes (`fork`,
       `execve`, `exit`, `wait4`), zombies until `wait4`, orphans to PID 1, panic when init
-      dies, address space freed with TLB shootdown; file descriptors, pipes, console
+      dies, address space freed with TLB shootdown; file descriptors, pipes, console;
+      test that a new process starts with a clean FPU/SSE state (FCW 0x37F, MXCSR 0x1F80,
+      XMM zero) and never sees another process's registers; a gap of 256 pages below the
+      stack like Linux's `stack_guard_gap`, so `mmap` cannot place a mapping right under it
+      (Stack Clash), with a test
 - [ ] P4: signals (`rt_sigaction`, `rt_sigprocmask`, `kill`, delivery, `rt_sigreturn`),
       `EINTR` and `SA_RESTART`; busybox `sh` as init; boot test with a shell script
 - [ ] every syscall has a small C test program; its deterministic output is compared with

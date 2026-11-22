@@ -18,8 +18,15 @@ use crate::{Result, root, run, step};
 /// 64 MiB: comfortably above the FAT32 minimum (about 33 MiB) and plenty for stage 0.
 const IMAGE_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Writes the boot image to `image`. A non-empty `command_line` is passed to the kernel.
-pub fn create(image: &Path, kernel: &Path, bootloader: &Path, command_line: &str) -> Result<()> {
+/// Writes the boot image to `image`, with `initramfs` as a module next to the kernel. A
+/// non-empty `command_line` is passed to the kernel.
+pub fn create(
+    image: &Path,
+    kernel: &Path,
+    bootloader: &Path,
+    initramfs: &Path,
+    command_line: &str,
+) -> Result<()> {
     step(&format!("creating the boot image {}", image.display()));
     // Start from an empty (all zero) file each time, so no stale files survive.
     File::create(image)?.set_len(IMAGE_SIZE)?;
@@ -42,6 +49,7 @@ pub fn create(image: &Path, kernel: &Path, bootloader: &Path, command_line: &str
         .arg(&config)
         .arg("::/boot/limine/limine.conf"))?;
     run(mtools("mcopy").arg(kernel).arg("::/boot/kernel"))?;
+    run(mtools("mcopy").arg(initramfs).arg("::/boot/initramfs.cpio"))?;
 
     Ok(())
 }

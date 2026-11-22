@@ -59,6 +59,13 @@ jobs:
         with:
           path: build/limine
           key: limine-${{ runner.os }}-${{ hashFiles('xtask/src/limine.rs') }}
+      # musl is built from a pinned Git commit (xtask/src/musl.rs); the user programs are
+      # compiled against it on every run.
+      - name: Cache the musl build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/musl
+          key: musl-${{ runner.os }}-${{ hashFiles('xtask/src/musl.rs') }}
       - run: cargo xtask build
       - run: cargo xtask test
       - name: Upload the logs
@@ -70,6 +77,7 @@ jobs:
             build/test-*.log
             build/failed/*.log
             build/limine/build.log
+            build/musl/build.log
           if-no-files-found: ignore
 
   dco:

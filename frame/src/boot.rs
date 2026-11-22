@@ -16,7 +16,7 @@ use limine::BaseRevision;
 use limine::memory_map::EntryType;
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
-    MemoryMapRequest, MpRequest, RequestsEndMarker, RequestsStartMarker,
+    MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker,
 };
 use limine::response::MpResponse;
 
@@ -66,6 +66,11 @@ static HHDM: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static MP: MpRequest = MpRequest::new();
+
+/// Files Limine loads next to the kernel (`module_path:` in `limine.conf`): the initramfs.
+#[used]
+#[unsafe(link_section = ".requests")]
+static MODULES: ModuleRequest = ModuleRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -260,5 +265,16 @@ impl BootInfo {
                 length: entry.length,
                 kind: MemoryKind::from_limine(entry.entry_type),
             })
+    }
+
+    /// The contents of the first boot module (the initramfs), if Limine loaded one.
+    ///
+    /// Limine puts modules in "kernel and modules" memory, which is never handed out as free
+    /// and stays in the direct map, so the bytes live for as long as the kernel.
+    pub fn initramfs(&self) -> Option<&'static [u8]> {
+        let module = MODULES.get_response()?.modules().first()?;
+        // SAFETY: Limine loaded `size` bytes at `addr`, a direct map address (see above);
+        // nothing writes to module memory, so a shared `'static` slice is sound.
+        Some(unsafe { core::slice::from_raw_parts(module.addr(), module.size() as usize) })
     }
 }

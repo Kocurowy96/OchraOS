@@ -17,6 +17,9 @@
 //! | `guardpage`   | write below a kernel stack -> page fault (guard page) |
 //! | `smep`        | execute a user page -> page fault (SMEP)              |
 //! | `smap`        | read a user page -> page fault (SMAP)                 |
+//!
+//! `test=usertests` instead runs every program in the initramfs's `/tests` (see
+//! [`run_user_tests`]), in place of `/init`.
 
 #[cfg(all(feature = "selftest", not(debug_assertions)))]
 compile_error!("the `selftest` feature must never be enabled in a release build");
@@ -40,9 +43,83 @@ pub fn run(name: &str) {
         // User programs that must be killed, while the kernel carries on.
         "userkernel" => spawn_user_program("kernel"),
         "userhlt" => spawn_user_program("hlt"),
+        "usertests" => {
+            USER_TESTS_RUNNING.store(true, core::sync::atomic::Ordering::Relaxed);
+            crate::sched::spawn("usertests", run_user_tests);
+        }
         // Cpu 1 is waiting for this signal, see `on_ap`.
         "apdoublefault" => AP_DOUBLE_FAULT_GO.store(true, core::sync::atomic::Ordering::Release),
         _ => log::error!("unknown self-test {name:?}"),
+    }
+}
+
+#[cfg(feature = "selftest")]
+static USER_TESTS_RUNNING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The first user program, watched so that "boot finished" comes only after it has ended.
+#[cfg(feature = "selftest")]
+static INIT: ochra_frame::sync::IrqMutex<Option<alloc::sync::Arc<crate::process::Process>>> =
+    ochra_frame::sync::IrqMutex::new(None);
+
+/// Called with the process started as `/init`.
+pub fn watch_init(_process: &alloc::sync::Arc<crate::process::Process>) {
+    #[cfg(feature = "selftest")]
+    INIT.lock().replace(_process.clone());
+}
+
+/// Whether `test=usertests` is on the command line; then `/init` is not started.
+pub fn runs_user_tests(command_line: &str) -> bool {
+    cfg!(feature = "selftest")
+        && command_line
+            .split_whitespace()
+            .any(|argument| argument == "test=usertests")
+}
+
+/// Runs the test programs from `/tests`, one at a time, each with its stdout captured, and
+/// logs one line per program: how it ended, and its output in hexadecimal (so the line
+/// stays one line whatever the program printed). `cargo xtask test` runs the same programs
+/// on the host Linux and compares.
+#[cfg(feature = "selftest")]
+fn run_user_tests() -> ! {
+    use alloc::vec::Vec;
+
+    let mut names: Vec<&str> = crate::initramfs::files()
+        .filter_map(|(path, _)| path.strip_prefix("tests/"))
+        .collect();
+    names.sort_unstable();
+    for name in &names {
+        let path = alloc::format!("/tests/{name}");
+        let process = match crate::process::spawn(&path, &[&path], &[], true) {
+            Ok(process) => process,
+            Err(errno) => panic!("user test {name}: cannot start it (errno {errno})"),
+        };
+        // No wait queues yet (P3): look again after every timer tick.
+        let exit = loop {
+            if let Some(exit) = process.exit() {
+                break exit;
+            }
+            ochra_frame::arch::interrupts::wait();
+        };
+        let output = process
+            .captured_output
+            .as_ref()
+            .map(|output| output.lock().clone())
+            .unwrap_or_default();
+        let hex: alloc::string::String = output
+            .iter()
+            .map(|byte| alloc::format!("{byte:02x}"))
+            .collect();
+        let ending = match exit {
+            crate::process::Exit::Status(status) => alloc::format!("exit {status}"),
+            crate::process::Exit::Signal(signal) => alloc::format!("signal {signal}"),
+        };
+        log::info!("user test {name}: {ending}, output {hex}");
+    }
+    log::info!("user tests: {} programs finished", names.len());
+    USER_TESTS_RUNNING.store(false, core::sync::atomic::Ordering::Release);
+    loop {
+        ochra_frame::arch::interrupts::wait();
     }
 }
 
@@ -71,6 +148,7 @@ pub fn run(name: &str) {
 /// Runs every check. Without the `selftest` feature it does nothing.
 #[cfg(feature = "selftest")]
 pub fn run_checks() {
+    check_random();
     check_frames();
     check_heap();
     check_cpus();
@@ -331,30 +409,29 @@ fn spawn_user_program(name: &'static str) {
     let mut code = frames::allocate().expect("out of memory");
     code.zero();
     code.write_bytes(0, ochra_frame::selftest::user_program(name));
-    let executable = UserAccess {
-        writable: false,
-        executable: true,
-    };
-    let writable = UserAccess {
-        writable: true,
-        executable: false,
-    };
+    let executable = UserAccess::READ_EXECUTE;
+    let writable = UserAccess::READ_WRITE;
     let mut stack = frames::allocate().expect("out of memory");
     stack.zero();
     let stack_page = USER_END - 4096;
     assert!(space.map(CODE, code, executable).is_ok());
     assert!(space.map(stack_page, stack, writable).is_ok());
-    crate::sched::spawn_user(name, Arc::new(space), CODE, USER_END);
+    crate::sched::spawn_user(name, Arc::new(space), CODE, USER_END, None);
 }
 
 /// Without self-tests there are no test tasks.
 #[cfg(not(feature = "selftest"))]
 pub fn spawn_tasks() {}
 
-/// Whether the tasks from [`spawn_tasks`] are done.
+/// Whether the tasks from [`spawn_tasks`], the user tests and `/init` are done.
 pub fn tasks_finished() -> bool {
     #[cfg(feature = "selftest")]
-    return TASKS_DONE.load(core::sync::atomic::Ordering::Acquire) == 2;
+    return TASKS_DONE.load(core::sync::atomic::Ordering::Acquire) == 2
+        && !USER_TESTS_RUNNING.load(core::sync::atomic::Ordering::Acquire)
+        && INIT
+            .lock()
+            .as_ref()
+            .is_none_or(|init| init.exit().is_some());
     #[cfg(not(feature = "selftest"))]
     true
 }
@@ -450,10 +527,7 @@ fn check_user_space() {
     use ochra_frame::mm::user::{MapError, USER_END, UserAccess, UserSpace};
 
     const BASE: u64 = 0x40_0000;
-    let read_write = UserAccess {
-        writable: true,
-        executable: false,
-    };
+    let read_write = UserAccess::READ_WRITE;
     let before = frames::stats();
     {
         let space = UserSpace::new().expect("self-test user space: out of memory");
@@ -486,10 +560,7 @@ fn check_user_space() {
             "self-test user space: kernel half"
         );
 
-        let read_only = UserAccess {
-            writable: false,
-            executable: false,
-        };
+        let read_only = UserAccess::READ;
         assert_eq!(
             space.protect(BASE, 4, read_only),
             3,
@@ -499,16 +570,32 @@ fn check_user_space() {
             space.translate(BASE).map(|(_, access)| access),
             Some(read_only)
         );
+        // No access (PROT_NONE): the frame stays, only the permissions go, and come back.
+        assert_eq!(space.protect(BASE, 1, UserAccess::NONE), 1);
+        assert_eq!(
+            space.translate(BASE).map(|(_, access)| access),
+            Some(UserAccess::NONE),
+            "self-test user space: no access"
+        );
+        assert_eq!(space.protect(BASE, 1, read_only), 1);
+        assert!(space.write_bytes(BASE + 4094, &[1, 2, 3, 4]).is_ok());
+        assert_eq!(
+            space.write_bytes(BASE + 3 * 4096 - 2, &[1, 2, 3, 4]),
+            Err(MapError::BadAddress),
+            "self-test user space: write past the mapping"
+        );
 
         let unmapped = space.unmap(BASE, 4);
         assert_eq!(unmapped.len(), 3, "self-test user space: unmap");
         for (page, frame) in unmapped.iter().enumerate() {
-            assert_eq!(
-                frame.read_u64(0),
-                0x0C4A_0000 + page as u64,
-                "self-test user space"
-            );
+            // `write_bytes` above crossed from page 0 into page 1, changing its first bytes.
+            let expected = match page {
+                1 => 0x0C4A_0403,
+                _ => 0x0C4A_0000 + page as u64,
+            };
+            assert_eq!(frame.read_u64(0), expected, "self-test user space");
         }
+        assert_eq!(unmapped[0].read_u64(511) >> 48, 0x0201);
         assert_eq!(
             space.translate(BASE),
             None,
@@ -534,4 +621,39 @@ fn check_user_space() {
     log::info!(
         "self-test user space: ok (map, protect, unmap, free; shootdown answered by {answered} CPUs)"
     );
+}
+
+/// Random numbers: the ChaCha20 block function against the test vector of RFC 8439
+/// (section 2.3.2), then a sanity check of the generator's output.
+#[cfg(feature = "selftest")]
+fn check_random() {
+    use ochra_frame::random;
+
+    let key: [u32; 8] = core::array::from_fn(|index| {
+        let byte = |offset: usize| (index * 4 + offset) as u32;
+        byte(0) | byte(1) << 8 | byte(2) << 16 | byte(3) << 24
+    });
+    let block = random::chacha20_block(&key, 1, &[0x0900_0000, 0x4a00_0000, 0]);
+    let expected_start = [0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15];
+    let expected_end = [0xcb, 0xd0, 0x83, 0xe8, 0xa2, 0x50, 0x3c, 0x4e];
+    assert_eq!(
+        block[..8],
+        expected_start,
+        "self-test random: ChaCha20 test vector"
+    );
+    assert_eq!(
+        block[56..],
+        expected_end,
+        "self-test random: ChaCha20 test vector"
+    );
+
+    let mut first = [0u8; 64];
+    let mut second = [0u8; 64];
+    random::fill(&mut first);
+    random::fill(&mut second);
+    assert!(
+        first != [0; 64] && first != second,
+        "self-test random: output"
+    );
+    log::info!("self-test random: ok (ChaCha20 test vector, output differs)");
 }

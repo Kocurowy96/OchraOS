@@ -28,6 +28,7 @@ pub mod color;
 pub mod cpu_local;
 pub mod mm;
 mod panic;
+pub mod random;
 #[cfg(feature = "selftest")]
 pub mod selftest;
 pub mod serial;

@@ -5,10 +5,13 @@
 //! Everything it produces goes to `build/` in the repository root (ignored by git).
 
 mod check_unsafe;
+mod cpio;
 mod image;
 mod limine;
+mod musl;
 mod qemu;
 mod test;
+mod userspace;
 
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -74,8 +77,9 @@ enum Profile {
 fn build(profile: Profile) -> Result<PathBuf> {
     let kernel = build_kernel(&[], profile)?;
     let bootloader = limine::build(&build_dir()?)?;
+    let (initramfs, _) = userspace::build()?;
     let image = build_dir()?.join("ochraos.img");
-    image::create(&image, &kernel, &bootloader, "")?;
+    image::create(&image, &kernel, &bootloader, &initramfs, "")?;
     Ok(image)
 }
 

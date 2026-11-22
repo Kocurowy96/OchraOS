@@ -11,6 +11,9 @@
 //! come" (or after a timeout). Each log is saved as `build/test-<name>.log`; the log of a
 //! failed boot, with QEMU's own error output, is also kept as `build/failed/<name>-<time>.log`,
 //! so a rare failure is not overwritten by the next run.
+//!
+//! The `usertests` boot runs the syscall test programs (`userspace/tests/`) in OchraOS; their
+//! output and exit status must be exactly what the same binaries give on the host Linux.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -18,7 +21,7 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::{Profile, Result, build_dir, build_kernel, image, limine, qemu, step};
+use crate::{Profile, Result, build_dir, build_kernel, image, limine, qemu, step, userspace};
 
 struct Case {
     name: &'static str,
@@ -39,11 +42,13 @@ const BOOT: &[&str] = &[
     "bootloader: Limine",
     "GDT, TSS and IDT loaded",
     "CPU protections:",
+    "random: ChaCha20 seeded",
     "physical memory:",
     "page tables:",
     "heap:",
     "interrupts: legacy PIC masked, local APIC in",
     "timer: local APIC timer at 100 Hz",
+    "self-test random: ok",
     "self-test frames: ok",
     "self-test heap: ok",
     "self-test cpus: ok",
@@ -66,7 +71,18 @@ const CASES: &[Case] = &[
             "cpu 3 online",
             "hello from ring 3",
             "user task hello exited with status 0",
+            "started /init as process 1",
+            "Hello from musl",
+            "process 1 (/init) exited with status 0",
         ],
+    },
+    // The syscall test programs; their results are compared with the host afterwards.
+    Case {
+        name: "usertests",
+        command_line: "test=usertests",
+        qemu_args: &[],
+        expected: &["programs finished", "boot finished, idling"],
+        anywhere: &[],
     },
     Case {
         name: "pagefault",
@@ -223,14 +239,16 @@ pub fn run() -> Result<()> {
     // Self-tests exist only in debug builds (the feature refuses release).
     let kernel = build_kernel(&["selftest"], Profile::Debug)?;
     let bootloader = limine::build(&build_dir()?)?;
+    let (initramfs, programs) = userspace::build()?;
     let image = build_dir()?.join("test.img");
 
     let mut failed = Vec::new();
     let mut kernel_addresses = Vec::new();
     let mut boot_log = String::new();
     let mut one_cpu_log = String::new();
+    let mut user_tests_log = String::new();
     for case in CASES {
-        image::create(&image, &kernel, &bootloader, case.command_line)?;
+        image::create(&image, &kernel, &bootloader, &initramfs, case.command_line)?;
         step(&format!("test {}: booting", case.name));
         let (log, qemu_errors) = boot(&image, case.qemu_args)?;
         std::fs::write(build_dir()?.join(format!("test-{}.log", case.name)), &log)?;
@@ -238,6 +256,7 @@ pub fn run() -> Result<()> {
         match case.name {
             "boot" => boot_log = log.clone(),
             "onecpu" => one_cpu_log = log.clone(),
+            "usertests" => user_tests_log = log.clone(),
             _ => {}
         }
 
@@ -284,8 +303,37 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Stage 2: Linux programs behave the same on OchraOS as on Linux.
+    step("test linux abi: user programs give the same results as on the host");
+    let tests: Vec<&userspace::Program> = programs
+        .iter()
+        .filter(|program| program.path.starts_with("/tests/"))
+        .collect();
+    let mut differences = Vec::new();
+    for program in &tests {
+        let name = &program.path["/tests/".len()..];
+        let on_host = run_on_host(program)?;
+        match result_in_log(&user_tests_log, name) {
+            Some(in_ochra) if in_ochra == on_host => {}
+            Some(in_ochra) => differences.push(format!(
+                "{name}:\n      host:    {}\n      OchraOS: {}",
+                on_host.describe(),
+                in_ochra.describe()
+            )),
+            None => differences.push(format!("{name}: no result in the log")),
+        }
+    }
+    if differences.is_empty() {
+        eprintln!("    ok ({} programs)", tests.len());
+    } else {
+        for difference in &differences {
+            eprintln!("    FAILED: {difference}");
+        }
+        failed.push("linux abi");
+    }
+
     if failed.is_empty() {
-        step(&format!("all {} tests passed", CASES.len() + 3));
+        step(&format!("all {} tests passed", CASES.len() + 4));
         Ok(())
     } else {
         Err(format!(
@@ -294,6 +342,66 @@ pub fn run() -> Result<()> {
         )
         .into())
     }
+}
+
+/// How a test program ended and what it wrote to stdout.
+#[derive(PartialEq, Eq)]
+struct Outcome {
+    /// `exit <status>` or `signal <number>`, as the kernel logs it.
+    ending: String,
+    output: Vec<u8>,
+}
+
+impl Outcome {
+    fn describe(&self) -> String {
+        format!(
+            "{}, output {:?}",
+            self.ending,
+            String::from_utf8_lossy(&self.output)
+        )
+    }
+}
+
+/// Runs a test program on the host as the kernel does: `argv[0]` is its path in the
+/// initramfs, and the environment is empty.
+fn run_on_host(program: &userspace::Program) -> Result<Outcome> {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    let output = std::process::Command::new(&program.file)
+        .arg0(&program.path)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()?;
+    let ending = match (output.status.code(), output.status.signal()) {
+        (Some(code), _) => format!("exit {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => return Err(format!("{}: no exit status", program.path).into()),
+    };
+    Ok(Outcome {
+        ending,
+        output: output.stdout,
+    })
+}
+
+/// Finds `user test <name>: <ending>, output <hex>` in the log.
+fn result_in_log(log: &str, name: &str) -> Option<Outcome> {
+    let log = strip_ansi(log);
+    let prefix = format!("user test {name}: ");
+    let line = log
+        .lines()
+        .find_map(|line| Some(&line[line.find(&prefix)? + prefix.len()..]))?;
+    // An empty output leaves nothing after "output" (the trailing space is trimmed).
+    let (ending, hex) = line.trim_end().split_once(", output")?;
+    let hex = hex.trim_start();
+    let output = (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(hex.get(index..index + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(Outcome {
+        ending: ending.to_string(),
+        output,
+    })
 }
 
 /// Saves the log of a failed boot under `build/failed/`, with the reason and QEMU's error

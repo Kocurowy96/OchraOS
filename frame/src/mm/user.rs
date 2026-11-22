@@ -11,6 +11,10 @@
 //! Frames mapped into a user address space belong to it: they are handed over as owned
 //! [`Frame`]s and come back as `Frame`s when unmapped, or are freed when the address space is
 //! dropped, together with its page tables.
+//!
+//! A page can also be mapped with no access at all (`PROT_NONE` in Linux, used for guard
+//! pages): its entry keeps the frame but is not present, so any access faults. Software bit 9
+//! ([`OWNED`]) marks every level-1 entry that holds a frame, present or not.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -25,11 +29,44 @@ use crate::sync::IrqMutex;
 /// First address past the user half.
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
 
-/// Permissions of a user page. (Every user page is readable.)
+/// Marks a level-1 entry that owns a frame (the CPU ignores bit 9).
+const OWNED: u64 = 1 << 9;
+
+/// Permissions of a user page, as in `mmap`'s `PROT_*` flags. The CPU cannot make a page
+/// writable or executable without making it readable, so those imply `readable`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserAccess {
+    pub readable: bool,
     pub writable: bool,
     pub executable: bool,
+}
+
+impl UserAccess {
+    /// No access: any use of the page faults.
+    pub const NONE: Self = Self {
+        readable: false,
+        writable: false,
+        executable: false,
+    };
+    pub const READ: Self = Self {
+        readable: true,
+        writable: false,
+        executable: false,
+    };
+    pub const READ_WRITE: Self = Self {
+        readable: true,
+        writable: true,
+        executable: false,
+    };
+    pub const READ_EXECUTE: Self = Self {
+        readable: true,
+        writable: false,
+        executable: true,
+    };
+
+    fn is_none(self) -> bool {
+        !self.readable && !self.writable && !self.executable
+    }
 }
 
 /// Why a page could not be mapped.
@@ -94,7 +131,7 @@ impl UserSpace {
             return Err((MapError::OutOfMemory, frame));
         };
         // SAFETY: `walk` returned an entry inside a live table of this space.
-        if unsafe { entry.read() } & PRESENT != 0 {
+        if unsafe { entry.read() } & OWNED != 0 {
             return Err((MapError::AlreadyMapped, frame));
         }
         let bits = entry_bits(access);
@@ -118,7 +155,7 @@ impl UserSpace {
                 // SAFETY: `leaf` returned an entry inside a live table of this space; we
                 // hold the lock.
                 let value = unsafe { entry.read() };
-                if value & PRESENT != 0 {
+                if value & OWNED != 0 {
                     // SAFETY: as above.
                     unsafe { entry.write(0) };
                     // SAFETY: the entry owned the frame (`map`) and is cleared now.
@@ -145,7 +182,7 @@ impl UserSpace {
                 };
                 // SAFETY: `leaf` returned an entry inside a live table; we hold the lock.
                 let value = unsafe { entry.read() };
-                if value & PRESENT != 0 {
+                if value & OWNED != 0 {
                     // SAFETY: as above.
                     unsafe { entry.write((value & ADDRESS_MASK) | entry_bits(access)) };
                     changed += 1;
@@ -164,13 +201,44 @@ impl UserSpace {
         let entry = self.leaf(virt)?;
         // SAFETY: `leaf` returned an entry inside a live table; we hold the lock.
         let value = unsafe { entry.read() };
-        (value & PRESENT != 0).then(|| {
+        (value & OWNED != 0).then(|| {
+            let present = value & PRESENT != 0;
             let access = UserAccess {
-                writable: value & WRITABLE != 0,
-                executable: value & NO_EXECUTE == 0,
+                readable: present,
+                writable: present && value & WRITABLE != 0,
+                executable: present && value & NO_EXECUTE == 0,
             };
             (PhysAddr(value & ADDRESS_MASK), access)
         })
+    }
+
+    /// Writes `bytes` to user address `virt` through the direct map, whatever the pages'
+    /// permissions (the loader fills read-only code pages this way). Fails if a page in the
+    /// range is not mapped.
+    pub fn write_bytes(&self, virt: u64, bytes: &[u8]) -> Result<(), MapError> {
+        let mut done = 0;
+        while done < bytes.len() {
+            let address = virt + done as u64;
+            let page = address & !(FRAME_SIZE - 1);
+            let offset = (address - page) as usize;
+            let length = (FRAME_SIZE as usize - offset).min(bytes.len() - done);
+            let _guard = self.lock.lock();
+            let entry = self.leaf(page).ok_or(MapError::BadAddress)?;
+            // SAFETY: `leaf` returned an entry inside a live table; we hold the lock.
+            let value = unsafe { entry.read() };
+            if value & OWNED == 0 {
+                return Err(MapError::BadAddress);
+            }
+            let target = direct_map(PhysAddr(value & ADDRESS_MASK));
+            // SAFETY: the frame is owned by this space and stays mapped while we hold the
+            // lock; `offset + length` is within the frame. User code may be writing to the
+            // same frame at the same time, which only makes the bytes it sees unpredictable.
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes[done..].as_ptr(), target.add(offset), length)
+            };
+            done += length;
+        }
+        Ok(())
     }
 
     /// The physical address of the PML4, for CR3.
@@ -236,7 +304,8 @@ unsafe fn free_table(table: PhysAddr, level: u32, range: core::ops::Range<usize>
     for index in range {
         // SAFETY: `index < 512`, inside the table frame, reached through the direct map.
         let value = unsafe { entries.add(index).read() };
-        if value & PRESENT == 0 {
+        let owns = if level > 1 { PRESENT } else { OWNED };
+        if value & owns == 0 {
             continue;
         }
         let address = PhysAddr(value & ADDRESS_MASK);
@@ -254,6 +323,9 @@ fn is_user_page(virt: u64) -> bool {
 }
 
 fn entry_bits(access: UserAccess) -> u64 {
+    if access.is_none() {
+        return OWNED;
+    }
     Access {
         writable: access.writable,
         executable: access.executable,
@@ -261,4 +333,5 @@ fn entry_bits(access: UserAccess) -> u64 {
     }
     .entry_bits()
         | USER
+        | OWNED
 }

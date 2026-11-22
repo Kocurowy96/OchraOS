@@ -96,6 +96,28 @@ pub fn enable_protections() -> Protections {
     }
 }
 
+const CR0_MONITOR_COPROCESSOR: u64 = 1 << 1;
+const CR0_EMULATION: u64 = 1 << 2;
+const CR0_TASK_SWITCHED: u64 = 1 << 3;
+const CR4_OSFXSR: u64 = 1 << 9;
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
+
+/// Lets user programs use the SSE registers and instructions, which every x86-64 CPU has and
+/// every x86-64 Linux program uses (the ABI passes floating point values in them). Until the
+/// OS declares (CR4.OSFXSR) that it saves this state on task switches (with `fxsave`, see
+/// `task`), SSE instructions raise #UD. The kernel itself is built without SSE, so it never
+/// touches these registers. (AVX needs `xsave` and comes later.)
+pub(crate) fn enable_sse() {
+    let mut cr0 = read_cr0();
+    cr0 &= !(CR0_EMULATION | CR0_TASK_SWITCHED);
+    cr0 |= CR0_MONITOR_COPROCESSOR;
+    // SAFETY: these bits only decide whether x87/SSE instructions run or trap; the kernel
+    // does not use them, and paging and protection bits are left as they are.
+    unsafe { write_cr0(cr0) };
+    // SAFETY: FXSR and SSE are part of x86-64 itself, so the CPU supports these bits.
+    unsafe { write_cr4(read_cr4() | CR4_OSFXSR | CR4_OSXMMEXCPT) };
+}
+
 fn read_cr0() -> u64 {
     let value;
     // SAFETY: reading CR0 has no side effects and touches no memory.

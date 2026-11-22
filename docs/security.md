@@ -11,6 +11,12 @@ Security is priority number one.
 - **Disk encryption:** enabled by default in the installer, can be unticked (from stage 7).
 - **Updates:** A/B images signed with Ed25519 and verified before install.
 - **Kernel:** SMEP/SMAP, KASLR, W^X, `unsafe` confined to one crate.
+- **W^X for processes:** by default no user memory is writable and executable at once (ELF
+  segments give `ENOEXEC`, `mmap`/`mprotect` give `EACCES`). JIT compilers get an exception
+  per application through Ochra Guard (see below).
+- **AVX state:** CR4.OSXSAVE stays off until the kernel saves the extended state with
+  `xsave` on task switches; until then programs see no AVX (CPUID reports OSXSAVE clear), so
+  they cannot leave AVX registers to leak into another process.
 - **Meltdown:** user page tables map the kernel half (supervisor-only) for now. Before
   OchraOS runs on a CPU affected by Meltdown (e.g. Haswell, as in the ThinkPad T440p), the
   kernel needs KPTI (separate user page tables without the kernel), switched off when
@@ -36,6 +42,10 @@ kernel, so it applies to root too.
 - **Secrets + network:** a process that read secrets (and its children) must ask before
   sending anything over the network.
 - **Wine:** no `Z:` drive mapping of `/` by default.
+- **JIT (writable and executable memory):** an exception to W^X granted per application with
+  the user's consent (like macOS's `allow-jit` entitlement). Ready-made profiles for
+  Wine/Proton (Windows programs often allocate `PAGE_EXECUTE_READWRITE`) and the JVM.
+  Implemented together with Wine (stage 7).
 - Audit log in Settings with revocation; a weekly privacy summary.
 - Camera, microphone, screen capture, location: consent + indicator in the panel.
 - Clipboard: readable only by the focused application.

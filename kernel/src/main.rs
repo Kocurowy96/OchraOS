@@ -16,7 +16,12 @@
 extern crate alloc;
 
 mod banner;
+mod elf;
+mod errno;
+mod initramfs;
 mod logger;
+mod memory;
+mod process;
 mod sched;
 mod selftest;
 mod syscall;
@@ -46,6 +51,15 @@ fn main(boot: &'static BootInfo) -> ! {
     info!("GDT, TSS and IDT loaded");
     info!("CPU protections: {protections}");
 
+    let seeding = ochra_frame::random::init();
+    if seeding.is_weak() {
+        log::warn!("random: no usable RDSEED or RDRAND, seeded from the time stamp counter only");
+    }
+    info!(
+        "random: ChaCha20 seeded (RDSEED {}, RDRAND {}, TSC)",
+        seeding.rdseed, seeding.rdrand
+    );
+
     let memory = frames::init(boot);
     info!(
         "physical memory: {} MiB in {} frames managed, {} free",
@@ -66,6 +80,15 @@ fn main(boot: &'static BootInfo) -> ! {
 
     let heap = heap::init();
     info!("heap: {} KiB mapped, grows on demand", heap.mapped / 1024);
+
+    match boot
+        .initramfs()
+        .map(|archive| (archive.len(), initramfs::init(archive)))
+    {
+        Some((bytes, Some(files))) => info!("initramfs: {files} files, {} KiB", bytes / 1024),
+        Some((_, None)) => log::error!("initramfs: not a valid cpio archive, ignored"),
+        None => log::warn!("initramfs: none loaded"),
+    }
 
     selftest::prepare(command_line);
     smp::init_boot_cpu();
@@ -107,11 +130,30 @@ fn main(boot: &'static BootInfo) -> ! {
     // boot stack (Limine's) is left behind.
     syscall::init();
     selftest::spawn_tasks();
+    if !selftest::runs_user_tests(command_line) {
+        start_init(command_line);
+    }
     // One idle task per CPU, so every CPU always has something to run.
     for _ in 0..smp::cpu_count() {
         sched::spawn("idle", idle);
     }
     sched::start(true);
+}
+
+/// Starts the first user program: `/init`, or the one named by `rdinit=` (as in Linux).
+/// Like Linux, it gets `HOME=/` and `TERM=linux` as its environment.
+fn start_init(command_line: &str) {
+    let path = command_line
+        .split_whitespace()
+        .find_map(|argument| argument.strip_prefix("rdinit="))
+        .unwrap_or("/init");
+    match process::spawn(path, &[path], &["HOME=/", "TERM=linux"], false) {
+        Ok(process) => {
+            info!("started {path} as process {}", process.id);
+            selftest::watch_init(&process);
+        }
+        Err(errno) => log::error!("cannot start {path} (errno {errno})"),
+    }
 }
 
 /// Where the other CPUs (APs) arrive once their CPU state is set up. They start their timer

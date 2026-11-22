@@ -103,8 +103,10 @@ impl fmt::Display for UserFault {
 
 /// What the kernel does for a syscall.
 pub type SyscallHandler = fn(&mut UserContext);
-/// What the kernel does when a user program faults. It must change the context (e.g. to run
-/// a signal handler) or never return (end the task).
+/// What the kernel does when a user program faults. If it returns, the program continues
+/// from the (possibly changed) context: the faulting instruction runs again, so the handler
+/// must have fixed the cause (e.g. mapped the missing stack page), changed the context (e.g.
+/// to run a signal handler), or else never return (end the task).
 pub type FaultHandler = fn(&mut UserContext, UserFault);
 
 static SYSCALL_HANDLER: Once<SyscallHandler> = Once::new();
