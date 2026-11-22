@@ -10,7 +10,18 @@ cargo xtask run      # boot in QEMU
 cargo xtask test     # run tests
 ```
 
-You need Rust (version pinned in `rust-toolchain.toml`), QEMU and OVMF.
+You need:
+
+- Rust (the version is pinned in `rust-toolchain.toml`; rustup installs it automatically),
+- QEMU (`qemu-system-x86_64`) and OVMF,
+- for building Limine from source: `gcc`, GNU `ld`, `make`, `nasm`, `curl`, `tar`,
+- `mtools` for writing the FAT boot image.
+
+On Arch / Garuda:
+
+```
+sudo pacman -S --needed qemu-system-x86 edk2-ovmf gcc make nasm mtools curl
+```
 
 ## Code style
 

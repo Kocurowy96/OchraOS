@@ -4,6 +4,9 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | Limine built from its pinned source release (SHA-256 checked) by `cargo xtask` | no binaries in the repository; the source tarball is reproducible and verifiable |
+| 2026-11-22 | `limine` crate pinned to 0.5.0 (protocol base revision 3) | 0.6 needs nightly (`ptr_metadata`); revision 3 has everything stage 0–1 need |
+| 2026-11-22 | Toolchain: pinned Rust stable, not nightly | reproducible builds; naked functions (stable since 1.88) replace the nightly `x86-interrupt` ABI |
 | 2026-11-22 | Windows apps: Wine by default, Proton for games, Windows VM as fallback (stage 9) | Wine is light and GPU-friendly; the VM covers what Wine cannot |
 | 2026-11-22 | Signing: Ed25519 (minisign style), root, release (YubiKey) and nightly key hierarchy | simple, and survives a lost hardware key |
 | 2026-11-22 | Hosting: GitHub Pages and Releases; self-hosting later on a homelab | free and stable; no server needed yet |

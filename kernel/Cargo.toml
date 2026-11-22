@@ -17,6 +17,7 @@ test = false
 bench = false
 
 [dependencies]
+limine = "=0.5.0"
 
 [lints]
 workspace = true

@@ -4,3 +4,9 @@
 # This is the "xtask" pattern: build logic written in Rust instead of shell scripts or make.
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# The kernel always runs at the fixed address chosen in `kernel/linker.ld`, so build it as a
+# plain static executable. The target's default is position-independent code, which would
+# need a relocation step at boot for no benefit.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static"]
