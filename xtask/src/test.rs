@@ -8,13 +8,15 @@
 //!
 //! The kernel never shuts the machine down; it halts. So QEMU's serial output is read line by
 //! line, and QEMU is stopped once the kernel prints a line that means "nothing more will
-//! come" (or after a timeout). Each log is saved as `build/test-<name>.log`.
+//! come" (or after a timeout). Each log is saved as `build/test-<name>.log`; the log of a
+//! failed boot, with QEMU's own error output, is also kept as `build/failed/<name>-<time>.log`,
+//! so a rare failure is not overwritten by the next run.
 
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{Profile, Result, build_dir, build_kernel, image, limine, qemu, step};
 
@@ -47,6 +49,7 @@ const BOOT: &[&str] = &[
     "self-test cpus: ok",
     "self-test interrupts: ok",
     "self-test timer: ok",
+    "self-test user space: ok",
     "breakpoint (int3) at",
 ];
 
@@ -61,6 +64,8 @@ const CASES: &[Case] = &[
             "cpu 1 online",
             "cpu 2 online",
             "cpu 3 online",
+            "hello from ring 3",
+            "user task hello exited with status 0",
         ],
     },
     Case {
@@ -144,6 +149,21 @@ const CASES: &[Case] = &[
         ],
         anywhere: &[],
     },
+    // User programs that break the rules are killed; the kernel carries on.
+    Case {
+        name: "userkernel",
+        command_line: "test=userkernel",
+        qemu_args: &[],
+        expected: &["boot finished, idling"],
+        anywhere: &["user task kernel killed: Page fault at 0xffff800000000000"],
+    },
+    Case {
+        name: "userhlt",
+        command_line: "test=userhlt",
+        qemu_args: &[],
+        expected: &["boot finished, idling"],
+        anywhere: &["user task hlt killed: General protection"],
+    },
     // An AP takes a double fault: it must land on that AP's own interrupt stack.
     Case {
         name: "apdoublefault",
@@ -212,7 +232,7 @@ pub fn run() -> Result<()> {
     for case in CASES {
         image::create(&image, &kernel, &bootloader, case.command_line)?;
         step(&format!("test {}: booting", case.name));
-        let log = boot(&image, case.qemu_args)?;
+        let (log, qemu_errors) = boot(&image, case.qemu_args)?;
         std::fs::write(build_dir()?.join(format!("test-{}.log", case.name)), &log)?;
         kernel_addresses.extend(kernel_virtual_address(&log));
         match case.name {
@@ -225,6 +245,8 @@ pub fn run() -> Result<()> {
             Ok(()) => eprintln!("    ok"),
             Err(problem) => {
                 eprintln!("    FAILED: {problem}");
+                let kept = keep_failed_log(case.name, &problem, &log, &qemu_errors)?;
+                eprintln!("    full log: {}", kept.display());
                 failed.push(case.name);
             }
         }
@@ -274,14 +296,39 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// Boots `image` headless and returns the serial output with colour codes removed.
-fn boot(image: &Path, extra_args: &[&str]) -> Result<String> {
+/// Saves the log of a failed boot under `build/failed/`, with the reason and QEMU's error
+/// output, and returns its path.
+fn keep_failed_log(name: &str, problem: &str, log: &str, qemu_errors: &str) -> Result<PathBuf> {
+    let dir = build_dir()?.join("failed");
+    std::fs::create_dir_all(&dir)?;
+    let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let path = dir.join(format!("{name}-{time}.log"));
+    let text = format!(
+        "test {name} failed: {problem}\n\n--- serial output ---\n{log}\n--- QEMU stderr ---\n{qemu_errors}\n"
+    );
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// Boots `image` headless and returns the serial output with colour codes removed, and
+/// QEMU's own error output.
+fn boot(image: &Path, extra_args: &[&str]) -> Result<(String, String)> {
     let mut qemu = qemu::command(image)?;
     qemu.args(["-display", "none", "-serial", "stdio", "-monitor", "none"])
         .args(extra_args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = qemu.spawn()?;
+
+    // QEMU's own messages (e.g. "KVM not available"), read on their own thread so a full
+    // pipe can never block QEMU.
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
 
     // Read QEMU's output on a separate thread, so the main thread can wait with a timeout.
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -299,7 +346,8 @@ fn boot(image: &Path, extra_args: &[&str]) -> Result<String> {
 
     let result = collect(&receiver);
     stop(&mut child);
-    result
+    let qemu_errors = errors.join().unwrap_or_default();
+    Ok((result?, qemu_errors))
 }
 
 /// Collects lines until the kernel is done, QEMU exits, or the timeout runs out.

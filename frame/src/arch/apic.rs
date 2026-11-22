@@ -195,6 +195,18 @@ pub fn start_timer(hz: u32) -> TimerInfo {
     TimerInfo { counts_per_ms, hz }
 }
 
+/// Sends interrupt `vector` to every other core.
+pub(crate) fn send_to_others(vector: u8) {
+    let apic = local();
+    // Destination shorthand 11 = "all excluding self", fixed delivery.
+    apic.write(INTERRUPT_COMMAND, (0b11 << 18) | u32::from(vector));
+    if apic.kind == Kind::XApic {
+        while apic.read(INTERRUPT_COMMAND) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Sends a non-maskable interrupt to every other core. Returns `false` if the local APIC is
 /// not set up yet (then nothing is sent).
 pub(crate) fn send_nmi_to_others() -> bool {

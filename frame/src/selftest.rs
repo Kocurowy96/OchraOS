@@ -76,3 +76,114 @@ pub fn smap() -> ! {
     let byte = unsafe { data.read_volatile() };
     unreachable!("SMAP is off: the kernel read {byte:#x} from a user page");
 }
+
+// Small user programs for the ring 3 self-tests, as position-independent machine code in
+// read-only data; the kernel copies them into a user page. (Real programs come from the
+// initramfs from stage 2 on; these test the entry and exit paths without any of that.)
+core::arch::global_asm!(
+    ".pushsection .rodata.ochra_user_tests, \"a\"",
+    // hello: write, EFAULT for a kernel and an unmapped pointer, ENOSYS, preserved
+    // registers across syscalls and preemption; exit_group(0), or exit_group(1) on a mismatch.
+    ".global ochra_user_hello_start",
+    "ochra_user_hello_start:",
+    "mov rbx, 0x0C4A0C4A",
+    "mov r12, 0x1234567",
+    // The message length, computed here: a difference of labels is not an immediate in
+    // Intel syntax.
+    "lea rsi, [rip + 5f]",
+    "lea rdx, [rip + 6f]",
+    "sub rdx, rsi",
+    "mov r13, rdx",
+    "mov eax, 1",
+    "mov edi, 1",
+    "syscall",
+    "cmp rax, r13",
+    "jne 7f",
+    "mov eax, 1",
+    "mov edi, 1",
+    "mov rsi, 0xffff800000000000",
+    "mov edx, 4",
+    "syscall",
+    "cmp rax, -14",
+    "jne 7f",
+    "mov eax, 1",
+    "mov edi, 1",
+    "mov esi, 0x1000",
+    "mov edx, 4",
+    "syscall",
+    "cmp rax, -14",
+    "jne 7f",
+    "mov eax, 1000",
+    "syscall",
+    "cmp rax, -38",
+    "jne 7f",
+    // Spin a while, so timer interrupts (and task switches) hit user mode.
+    "mov ecx, 5000000",
+    "3:",
+    "pause",
+    "dec ecx",
+    "jnz 3b",
+    "cmp rbx, 0x0C4A0C4A",
+    "jne 7f",
+    "cmp r12, 0x1234567",
+    "jne 7f",
+    "mov eax, 231",
+    "xor edi, edi",
+    "syscall",
+    "7:",
+    "mov eax, 231",
+    "mov edi, 1",
+    "syscall",
+    "5:",
+    ".ascii \"hello from ring 3\\n\"",
+    "6:",
+    ".global ochra_user_hello_end",
+    "ochra_user_hello_end:",
+    // kernel: reads kernel memory, which is supervisor-only.
+    ".global ochra_user_kernel_start",
+    "ochra_user_kernel_start:",
+    "mov rax, 0xffff800000000000",
+    "mov rax, [rax]",
+    "ud2",
+    ".global ochra_user_kernel_end",
+    "ochra_user_kernel_end:",
+    // hlt: a privileged instruction.
+    ".global ochra_user_hlt_start",
+    "ochra_user_hlt_start:",
+    "hlt",
+    "ud2",
+    ".global ochra_user_hlt_end",
+    "ochra_user_hlt_end:",
+    ".popsection",
+);
+
+/// The machine code of a user test program: `hello`, `kernel` or `hlt`.
+pub fn user_program(name: &str) -> &'static [u8] {
+    unsafe extern "C" {
+        // SAFETY: defined by the `global_asm!` above; only their addresses are used.
+        safe static ochra_user_hello_start: u8;
+        safe static ochra_user_hello_end: u8;
+        safe static ochra_user_kernel_start: u8;
+        safe static ochra_user_kernel_end: u8;
+        safe static ochra_user_hlt_start: u8;
+        safe static ochra_user_hlt_end: u8;
+    }
+    let (start, end) = match name {
+        "hello" => (
+            &raw const ochra_user_hello_start,
+            &raw const ochra_user_hello_end,
+        ),
+        "kernel" => (
+            &raw const ochra_user_kernel_start,
+            &raw const ochra_user_kernel_end,
+        ),
+        "hlt" => (
+            &raw const ochra_user_hlt_start,
+            &raw const ochra_user_hlt_end,
+        ),
+        _ => panic!("no user test program {name:?}"),
+    };
+    let length = end as usize - start as usize;
+    // SAFETY: the labels delimit bytes in read-only data that live as long as the kernel.
+    unsafe { core::slice::from_raw_parts(start, length) }
+}

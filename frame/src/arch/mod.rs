@@ -11,6 +11,7 @@ pub mod interrupts;
 pub mod pic;
 mod pit;
 pub(crate) mod port;
+pub(crate) mod syscall;
 
 use alloc::boxed::Box;
 use core::arch::asm;
@@ -22,16 +23,18 @@ use crate::mm::paging::KernelStack;
 pub fn init() -> cpu::Protections {
     gdt::init();
     idt::init();
+    syscall::init();
     cpu::enable_protections()
 }
 
 /// The same for an AP (see `smp`): its own GDT and TSS, with a double fault stack that has
 /// a guard page, the shared IDT, and the protections. Needs paging and the heap.
-pub(crate) fn init_ap() -> cpu::Protections {
+pub(crate) fn init_ap() -> (cpu::Protections, &'static gdt::CpuTables) {
     let double_fault_stack = Box::leak(Box::new(KernelStack::new(4)));
-    gdt::init_ap(double_fault_stack.top());
+    let tables = gdt::init_ap(double_fault_stack.top());
     idt::load();
-    cpu::enable_protections()
+    syscall::init();
+    (cpu::enable_protections(), tables)
 }
 
 /// Stops this CPU for good.

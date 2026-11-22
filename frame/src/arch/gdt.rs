@@ -34,11 +34,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const KERNEL_CODE: u16 = 2 * 8;
 /// Kernel data / stack segment selector (GDT index 3, ring 0).
 pub const KERNEL_DATA: u16 = 3 * 8;
+/// 32-bit user code segment selector (GDT index 4, ring 3). Unused for now, but `sysret`
+/// and Linux's layout expect it right before the user data segment.
+pub const USER32_CODE: u16 = (4 * 8) | 3;
+/// User data / stack segment selector (GDT index 5, ring 3).
+pub const USER_DATA: u16 = (5 * 8) | 3;
+/// 64-bit user code segment selector (GDT index 6, ring 3).
+pub const USER_CODE: u16 = (6 * 8) | 3;
 /// TSS selector (GDT index 8; a TSS descriptor takes two entries, 8 and 9).
 const TSS_SELECTOR: u16 = 8 * 8;
 
-/// Number of GDT entries. Index 0 must be empty; 1 (Linux: 32-bit kernel code) and
-/// 4–7 (32/64-bit user code and user data, needed from stage 2) are reserved and empty for now.
+/// Number of GDT entries. Index 0 must be empty; 1 (Linux: 32-bit kernel code) and 7 (Linux:
+/// unused) stay empty.
 const ENTRIES: usize = 10;
 
 // A segment descriptor in bits. Only the "access" byte (bits 40–47) and the flags (bits
@@ -51,9 +58,13 @@ const ENTRIES: usize = 10;
 // flags: 0xA = granularity 4 KiB + L (64-bit code); 0xC = granularity 4 KiB + 32-bit operands.
 const KERNEL_CODE_DESCRIPTOR: u64 = 0x00AF_9B00_0000_FFFF;
 const KERNEL_DATA_DESCRIPTOR: u64 = 0x00CF_9300_0000_FFFF;
+// The same with DPL 3 (access 0xFB / 0xF3); the 32-bit user code segment has no L flag.
+const USER32_CODE_DESCRIPTOR: u64 = 0x00CF_FB00_0000_FFFF;
+const USER_DATA_DESCRIPTOR: u64 = 0x00CF_F300_0000_FFFF;
+const USER_CODE_DESCRIPTOR: u64 = 0x00AF_FB00_0000_FFFF;
 
 /// One CPU's GDT and TSS.
-struct CpuTables {
+pub(crate) struct CpuTables {
     /// The entries are atomics only because the CPU writes into the table: `ltr` sets the
     /// "busy" bit in the TSS descriptor. With a plain array Rust would assume the memory never
     /// changes (and could even put it in read-only memory).
@@ -90,6 +101,9 @@ impl CpuTables {
         let gdt = &self.gdt;
         gdt[usize::from(KERNEL_CODE / 8)].store(KERNEL_CODE_DESCRIPTOR, Ordering::Relaxed);
         gdt[usize::from(KERNEL_DATA / 8)].store(KERNEL_DATA_DESCRIPTOR, Ordering::Relaxed);
+        gdt[usize::from(USER32_CODE / 8)].store(USER32_CODE_DESCRIPTOR, Ordering::Relaxed);
+        gdt[usize::from(USER_DATA / 8)].store(USER_DATA_DESCRIPTOR, Ordering::Relaxed);
+        gdt[usize::from(USER_CODE / 8)].store(USER_CODE_DESCRIPTOR, Ordering::Relaxed);
         gdt[usize::from(TSS_SELECTOR / 8)].store(tss_low, Ordering::Relaxed);
         gdt[usize::from(TSS_SELECTOR / 8) + 1].store(tss_high, Ordering::Relaxed);
     }
@@ -112,6 +126,20 @@ impl CpuTables {
         unsafe {
             let entries = addr_of_mut!((*self.tss.get()).interrupt_stacks).cast::<u64>();
             entries.add(index).write_unaligned(top);
+        }
+    }
+
+    /// Sets the stack the CPU switches to when an interrupt or exception arrives in user mode
+    /// (RSP0 in the TSS): the top of the current task's kernel stack. Only the CPU owning
+    /// these tables calls this, with interrupts off.
+    pub(crate) fn set_kernel_stack(&self, top: u64) {
+        // SAFETY: as in `set_interrupt_stack`: a valid, possibly unaligned field of a live
+        // TSS, written only by its own CPU; the CPU reads it only on an entry from user mode,
+        // which cannot happen while this CPU runs kernel code with interrupts off.
+        unsafe {
+            addr_of_mut!((*self.tss.get()).privilege_stacks)
+                .cast::<u64>()
+                .write_unaligned(top);
         }
     }
 
@@ -186,15 +214,21 @@ pub fn init() {
     BOOT_TABLES.load();
 }
 
+/// The boot CPU's tables.
+pub(crate) fn boot_tables() -> &'static CpuTables {
+    &BOOT_TABLES
+}
+
 /// Creates and loads the GDT and TSS of an AP, with `double_fault_stack` (a stack top) for
 /// double faults. Call once on every AP.
-pub(crate) fn init_ap(double_fault_stack: u64) {
+pub(crate) fn init_ap(double_fault_stack: u64) -> &'static CpuTables {
     let tables: &'static CpuTables = Box::leak(Box::new(CpuTables::new()));
     // SAFETY: the new TSS is not loaded yet; the caller passes a stack that lives for ever
     // and is used only by this CPU's double fault handler.
     unsafe { tables.set_interrupt_stack(DOUBLE_FAULT_IST, double_fault_stack) };
     tables.fill();
     tables.load();
+    tables
 }
 
 /// Loads `gdt` and reloads every segment register with its kernel selector.

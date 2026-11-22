@@ -21,6 +21,10 @@ const CR0_WRITE_PROTECT: u64 = 1 << 16;
 const CR4_UMIP: u64 = 1 << 11;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
+
+/// Whether SMAP is on, so `stac`/`clac` exist (they are invalid opcodes on CPUs without SMAP).
+pub(crate) static SMAP_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 const EFER_NO_EXECUTE: u64 = 1 << 11;
 /// Model-specific register number of EFER (Extended Feature Enable Register).
 const IA32_EFER: u32 = 0xC000_0080;
@@ -64,6 +68,8 @@ pub fn enable_protections() -> Protections {
     }
     if has_smap {
         cr4 |= CR4_SMAP;
+        // All CPUs of a machine are the same model, so one flag serves them all.
+        SMAP_ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     if has_umip {
         cr4 |= CR4_UMIP;

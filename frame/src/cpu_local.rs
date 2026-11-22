@@ -15,8 +15,11 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::arch::asm;
+use core::mem::offset_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::cpu::{read_msr, write_msr};
+use crate::arch::gdt::CpuTables;
 use crate::arch::interrupts;
 use crate::sync::IrqMutex;
 use crate::task::Task;
@@ -27,20 +30,32 @@ const IA32_GS_BASE: u32 = 0xC000_0101;
 pub(crate) struct PerCpu {
     /// The address of this structure; must stay the first field (read as `gs:[0]`).
     this: *const PerCpu,
+    /// Top of the current task's kernel stack, where the `syscall` entry switches to.
+    kernel_stack_top: AtomicU64,
+    /// Where the `syscall` entry parks the user stack pointer while switching stacks.
+    user_rsp_scratch: AtomicU64,
+    /// This CPU's GDT and TSS.
+    tables: &'static CpuTables,
     index: u32,
     apic_id: u32,
     /// The task running on this CPU (`None` before the scheduler starts here).
     pub(crate) current_task: IrqMutex<Option<Arc<Task>>>,
+    /// The last TLB shootdown request this CPU answered (see `mm::tlb`).
+    pub(crate) tlb_sequence: AtomicU64,
 }
 
 /// Creates this CPU's `PerCpu` and points GS at it. Call once per CPU, after the GDT is
 /// loaded (loading segment registers may clear the GS base) and the heap works.
-pub(crate) fn init(index: u32, apic_id: u32) {
+pub(crate) fn init(index: u32, apic_id: u32, tables: &'static CpuTables) {
     let data = Box::leak(Box::new(PerCpu {
         this: core::ptr::null(),
+        kernel_stack_top: AtomicU64::new(0),
+        user_rsp_scratch: AtomicU64::new(0),
+        tables,
         index,
         apic_id,
         current_task: IrqMutex::new(None),
+        tlb_sequence: AtomicU64::new(0),
     }));
     data.this = &raw const *data;
     // SAFETY: `data` is leaked, so it lives for ever, and it belongs to this CPU alone (each
@@ -65,6 +80,18 @@ pub(crate) fn this() -> Option<&'static PerCpu> {
     // SAFETY: `init` leaked the structure, so it lives for ever; it is only accessed through
     // shared references (mutable parts are behind locks).
     Some(unsafe { &*pointer })
+}
+
+/// Offsets of the fields the `syscall` entry reaches through `gs:` (see `arch::syscall`).
+pub(crate) const KERNEL_STACK_TOP_OFFSET: usize = offset_of!(PerCpu, kernel_stack_top);
+pub(crate) const USER_RSP_SCRATCH_OFFSET: usize = offset_of!(PerCpu, user_rsp_scratch);
+
+/// Makes `top` the kernel stack this CPU enters on from user mode (`syscall`, interrupts and
+/// exceptions). Called on every task switch, with interrupts off.
+pub(crate) fn set_kernel_stack(top: u64) {
+    let cpu = this().expect("per-CPU data is set up before tasks run");
+    cpu.kernel_stack_top.store(top, Ordering::Relaxed);
+    cpu.tables.set_kernel_stack(top);
 }
 
 /// Logical index of the CPU this code runs on (the boot CPU is 0; also 0 before per-CPU data

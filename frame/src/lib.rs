@@ -34,6 +34,7 @@ pub mod serial;
 pub mod smp;
 pub mod sync;
 pub mod task;
+pub mod user_mode;
 
 pub use boot::BootInfo;
 

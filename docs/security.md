@@ -11,6 +11,10 @@ Security is priority number one.
 - **Disk encryption:** enabled by default in the installer, can be unticked (from stage 7).
 - **Updates:** A/B images signed with Ed25519 and verified before install.
 - **Kernel:** SMEP/SMAP, KASLR, W^X, `unsafe` confined to one crate.
+- **Meltdown:** user page tables map the kernel half (supervisor-only) for now. Before
+  OchraOS runs on a CPU affected by Meltdown (e.g. Haswell, as in the ThinkPad T440p), the
+  kernel needs KPTI (separate user page tables without the kernel), switched off when
+  `IA32_ARCH_CAPABILITIES` reports `RDCL_NO`. Not implemented yet.
 - **Firewall:** at first no service listens externally; nftables compatibility later.
 
 ## Ochra Guard

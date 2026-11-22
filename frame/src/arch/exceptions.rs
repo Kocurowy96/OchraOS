@@ -37,37 +37,70 @@ use crate::{SHOW_ADDRESSES, serial};
 #[repr(C)]
 #[derive(Debug)]
 pub struct ExceptionFrame {
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    r11: u64,
-    r10: u64,
-    r9: u64,
-    r8: u64,
-    rbp: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    rcx: u64,
-    rbx: u64,
-    rax: u64,
+    pub(crate) r15: u64,
+    pub(crate) r14: u64,
+    pub(crate) r13: u64,
+    pub(crate) r12: u64,
+    pub(crate) r11: u64,
+    pub(crate) r10: u64,
+    pub(crate) r9: u64,
+    pub(crate) r8: u64,
+    pub(crate) rbp: u64,
+    pub(crate) rdi: u64,
+    pub(crate) rsi: u64,
+    pub(crate) rdx: u64,
+    pub(crate) rcx: u64,
+    pub(crate) rbx: u64,
+    pub(crate) rax: u64,
     /// Pushed by the stub.
-    vector: u64,
+    pub(crate) vector: u64,
     /// Pushed by the CPU, or 0 pushed by the stub.
-    error_code: u64,
+    pub(crate) error_code: u64,
     // Pushed by the CPU.
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
+    pub(crate) rip: u64,
+    pub(crate) cs: u64,
+    pub(crate) rflags: u64,
+    pub(crate) rsp: u64,
+    pub(crate) ss: u64,
 }
 
 impl ExceptionFrame {
     /// The vector number of the exception or interrupt.
     pub fn vector(&self) -> u64 {
         self.vector
+    }
+
+    /// A frame with every field zero, to be filled in.
+    pub(crate) const fn zeroed() -> Self {
+        Self {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: 0,
+            rsi: 0,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: 0,
+            vector: 0,
+            error_code: 0,
+            rip: 0,
+            cs: 0,
+            rflags: 0,
+            rsp: 0,
+            ss: 0,
+        }
+    }
+
+    /// Whether the interrupted code ran in user mode (privilege level 3 in the saved CS).
+    pub(crate) fn came_from_user_mode(&self) -> bool {
+        self.cs & 3 == 3
     }
 }
 
@@ -168,14 +201,31 @@ pub static ENTRY_POINTS: [extern "C" fn(); 32] = [
     reserved_31,
 ];
 
-/// Saves the registers, calls the Rust handler, restores the registers and returns to the
-/// interrupted code.
+/// Common entry of every interrupt and exception. If the interrupted code ran in user mode
+/// (the low two bits of the saved CS, its privilege level, are 3), GS still holds the user's
+/// base: `swapgs` brings in the kernel's per-CPU one first. At this point the stack holds the
+/// vector, the error code, then RIP and CS.
+#[unsafe(naked)]
+pub(super) extern "C" fn common_entry() {
+    naked_asm!(
+        "test qword ptr [rsp + 24], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
+        "jmp {body}",
+        body = sym common_body,
+    )
+}
+
+/// Saves the registers, calls the Rust handler, then continues to [`common_exit`]. GS is
+/// already the kernel's (see [`common_entry`]; the `syscall` entry swaps it itself).
 ///
 /// Stack alignment: the CPU aligns RSP to 16 bytes before pushing its frame. The frame
 /// (5 qwords), error code, vector and 15 registers make 22 qwords = 176 bytes, a multiple of
-/// 16, so RSP is aligned at the `call` as the System V ABI requires.
+/// 16, so RSP is aligned at the `call` as the System V ABI requires. (The `syscall` entry
+/// starts from the 16-byte-aligned top of a kernel stack and pushes the same 7 qwords.)
 #[unsafe(naked)]
-pub(super) extern "C" fn common_entry() {
+pub(super) extern "C" fn common_body() {
     naked_asm!(
         "push rax",
         "push rbx",
@@ -197,6 +247,20 @@ pub(super) extern "C" fn common_entry() {
         // The ABI expects the direction flag clear; the interrupted code may have set it.
         "cld",
         "call {handler}",
+        "jmp {exit}",
+        handler = sym handle_exception,
+        exit = sym common_exit,
+    )
+}
+
+/// Restores the registers of the frame at RSP and returns to the code it describes: back to
+/// user mode (`swapgs` first) if its CS has privilege level 3.
+///
+/// Always `iretq`, never `sysret`: `sysret` with a non-canonical RCX raises the #GP in ring 0
+/// with the user's stack (CVE-2012-0217), and `iretq` restores everything from one frame.
+#[unsafe(naked)]
+pub(super) extern "C" fn common_exit() {
+    naked_asm!(
         "pop r15",
         "pop r14",
         "pop r13",
@@ -214,24 +278,48 @@ pub(super) extern "C" fn common_entry() {
         "pop rax",
         // Drop the vector and the error code.
         "add rsp, 16",
+        "test qword ptr [rsp + 8], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
         "iretq",
-        handler = sym handle_exception,
     )
+}
+
+/// Leaves the kernel for user mode with the registers in `frame`. Used to enter a new user
+/// task; `frame` must describe user mode (`user_mode::enter` builds it).
+///
+/// # Safety
+///
+/// `frame` must be a user-mode frame (CS and SS user selectors, RIP below the kernel half),
+/// on the current task's kernel stack, and interrupts must be off.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn return_to_user(frame: *const ExceptionFrame) -> ! {
+    naked_asm!("mov rsp, rdi", "jmp {exit}", exit = sym common_exit)
 }
 
 const NMI: u64 = 2;
 const BREAKPOINT: u64 = 3;
 const DOUBLE_FAULT: u64 = 8;
-const PAGE_FAULT: u64 = 14;
+pub(crate) const GENERAL_PROTECTION: u64 = 13;
+pub(crate) const PAGE_FAULT: u64 = 14;
 
-extern "C" fn handle_exception(frame: &ExceptionFrame) {
+extern "C" fn handle_exception(frame: &mut ExceptionFrame) {
+    if frame.vector == NMI && crate::smp::stop_requested() {
+        // Another CPU crashed and stops everyone; it prints the report.
+        halt_forever();
+    }
+    if frame.came_from_user_mode() {
+        crate::user_mode::handle(frame);
+        return;
+    }
     if frame.vector >= u64::from(interrupts::FIRST_VECTOR) {
         interrupts::dispatch(frame);
         return;
     }
-    if frame.vector == NMI && crate::smp::stop_requested() {
-        // Another CPU crashed and stops everyone; it prints the report.
-        halt_forever();
+    if frame.vector == PAGE_FAULT && crate::user_mode::fix_up(frame) {
+        // A kernel access to user memory faulted; it resumes at its fixup code.
+        return;
     }
     if frame.vector == BREAKPOINT {
         // `int3` is only ever placed on purpose, never inside the logger, so taking the
@@ -345,7 +433,7 @@ fn print_registers(out: &mut impl Write, f: &ExceptionFrame) {
 }
 
 /// Human-readable name and mnemonic of an exception vector (Intel SDM vol. 3, table 6-1).
-fn name(vector: u64) -> (&'static str, &'static str) {
+pub(crate) fn name(vector: u64) -> (&'static str, &'static str) {
     match vector {
         0 => ("Divide error", "DE"),
         1 => ("Debug", "DB"),
@@ -409,7 +497,7 @@ impl core::fmt::Display for PageFaultCause {
 }
 
 /// CR2 holds the address that caused the last page fault.
-fn read_cr2() -> u64 {
+pub(crate) fn read_cr2() -> u64 {
     let value;
     // SAFETY: reading CR2 has no side effects and touches no memory.
     unsafe { asm!("mov {}, cr2", out(reg) value, options(nomem, nostack, preserves_flags)) };

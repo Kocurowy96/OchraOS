@@ -10,11 +10,26 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use ochra_frame::arch::interrupts;
+use ochra_frame::mm::user::UserSpace;
 use ochra_frame::sync::IrqMutex;
 use ochra_frame::task::{self, Task};
 
 /// Tasks waiting for the CPU, in the order they will get it. The running task is not here.
 static RUN_QUEUE: IrqMutex<VecDeque<Arc<Task>>> = IrqMutex::new(VecDeque::new());
+
+/// Creates a user task (see `task::spawn_user`) and puts it at the end of the queue.
+#[cfg_attr(
+    not(feature = "selftest"),
+    expect(
+        dead_code,
+        reason = "only the self-tests start user tasks until init (stage 2, P2)"
+    )
+)]
+pub fn spawn_user(name: &'static str, space: Arc<UserSpace>, entry: u64, stack: u64) {
+    RUN_QUEUE
+        .lock()
+        .push_back(task::spawn_user(name, space, entry, stack));
+}
 
 /// Set by the boot CPU once the first tasks are queued; the other CPUs wait for it.
 static READY: AtomicBool = AtomicBool::new(false);

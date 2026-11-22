@@ -51,7 +51,12 @@ pub fn init_boot_cpu() {
         || core::arch::x86_64::__cpuid(1).ebx >> 24,
         |response| response.bsp_lapic_id(),
     );
-    cpu_local::init(0, apic_id);
+    cpu_local::init(0, apic_id, arch::gdt::boot_tables());
+}
+
+/// How many other CPUs are online (and take interrupts) besides the one asking.
+pub(crate) fn other_cpus_online() -> u32 {
+    ONLINE.load(Ordering::Acquire)
 }
 
 /// Starts every AP. Each one sets up its CPU state, then runs `main`. Returns the number of
@@ -123,9 +128,9 @@ extern "C" fn ap_entry(cpu: &Cpu) -> ! {
     // Our page tables first: they map everything Limine's did that we still use (the kernel
     // image, the direct map with this stack and `cpu`), plus the heap and our stacks.
     paging::activate_kernel_space();
-    let protections = arch::init_ap();
+    let (protections, tables) = arch::init_ap();
     let index = cpu.extra.load(Ordering::Relaxed) as u32;
-    cpu_local::init(index, cpu.lapic_id);
+    cpu_local::init(index, cpu.lapic_id, tables);
     let info = CpuInfo {
         index,
         apic_id: cpu.lapic_id,

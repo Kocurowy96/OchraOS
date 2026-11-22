@@ -46,6 +46,14 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    /* Exception fixups for user memory access (frame/src/user_mode.rs): pairs of relative
+     * offsets "instruction that may fault, where to continue". */
+    .ochra_fixup : ALIGN(4) {
+        __ochra_fixup_start = .;
+        KEEP(*(.ochra_fixup))
+        __ochra_fixup_end = .;
+    } :rodata
+
     /* Symbol and relocation tables used by Limine to relocate the kernel. */
     .dynsym   : { *(.dynsym) } :rodata
     .gnu.hash : { *(.gnu.hash) } :rodata

@@ -29,7 +29,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::interrupts;
 use crate::cpu_local;
-use crate::mm::paging::KernelStack;
+use crate::mm::paging::{self, KernelStack};
+use crate::mm::user::UserSpace;
 use crate::sync::IrqMutex;
 
 /// Stack size of a task: 32 KiB (debug builds use a lot of stack for formatting).
@@ -43,6 +44,11 @@ pub struct Task {
     saved_rsp: UnsafeCell<u64>,
     /// A CPU runs this task, or is still saving it (see the module documentation).
     on_cpu: AtomicBool,
+    /// The user address space this task runs in; `None` for kernel-only tasks, which run on
+    /// the kernel's page tables.
+    space: Option<Arc<UserSpace>>,
+    /// For a user task: where it starts in user mode (instruction and stack pointer).
+    user_start: Option<(u64, u64)>,
     /// Owned so it lives as long as the task.
     _stack: KernelStack,
 }
@@ -67,9 +73,37 @@ impl Task {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Creates a task that will run `entry` (with interrupts on) the first time it is switched
-/// to. Tasks do not end yet, hence `-> !`.
+/// Creates a kernel task that will run `entry` (with interrupts on) the first time it is
+/// switched to. Tasks do not end yet, hence `-> !`.
 pub fn spawn(name: &'static str, entry: fn() -> !) -> Arc<Task> {
+    spawn_in(name, entry, None)
+}
+
+/// Creates a user task: it runs in `space` and starts in user mode at `entry` with the stack
+/// pointer `stack`. Its kernel stack serves its syscalls and interrupts.
+pub fn spawn_user(name: &'static str, space: Arc<UserSpace>, entry: u64, stack: u64) -> Arc<Task> {
+    create(name, start_user_task, Some(space), Some((entry, stack)))
+}
+
+/// Like [`spawn`], but the task runs with `space` loaded in CR3.
+pub fn spawn_in(name: &'static str, entry: fn() -> !, space: Option<Arc<UserSpace>>) -> Arc<Task> {
+    create(name, entry, space, None)
+}
+
+/// First code of a user task, on its kernel stack: off to user mode.
+fn start_user_task() -> ! {
+    let task = current().expect("a task is running");
+    let (entry, stack) = task.user_start.expect("only user tasks start here");
+    drop(task);
+    crate::user_mode::enter(entry, stack)
+}
+
+fn create(
+    name: &'static str,
+    entry: fn() -> !,
+    space: Option<Arc<UserSpace>>,
+    user_start: Option<(u64, u64)>,
+) -> Arc<Task> {
     let stack = KernelStack::new(STACK_PAGES);
     // The first switch to the task "returns" into `task_trampoline`, popping six zeroed
     // callee-saved registers first; r12 carries `entry`. Seven slots in all, placed so that
@@ -93,6 +127,8 @@ pub fn spawn(name: &'static str, entry: fn() -> !) -> Arc<Task> {
         name,
         saved_rsp: UnsafeCell::new(rsp),
         on_cpu: AtomicBool::new(false),
+        space,
+        user_start,
         _stack: stack,
     })
 }
@@ -113,6 +149,8 @@ pub fn start(first: Arc<Task>) -> ! {
     claim(&first);
     // SAFETY: `first` is claimed by this CPU, so its saved stack pointer is stable.
     let next_rsp = unsafe { *first.saved_rsp.get() };
+    load_space(first.space.as_deref());
+    cpu_local::set_kernel_stack(first._stack.top());
     *current_slot().lock() = Some(first);
     // The boot stack's context and flag are throw-away variables: nothing ever switches back.
     let mut boot_rsp = 0;
@@ -141,6 +179,18 @@ pub fn switch_to(next: Arc<Task>) {
     claim(&next);
     // SAFETY: `next` is claimed by this CPU, so its saved stack pointer is stable.
     let next_rsp = unsafe { *next.saved_rsp.get() };
+    let same_space = match (&previous.space, &next.space) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same_space {
+        load_space(next.space.as_deref());
+        if let Some(space) = &previous.space {
+            space.note_unloaded();
+        }
+    }
+    cpu_local::set_kernel_stack(next._stack.top());
     // The per-CPU current task keeps `next` alive; `previous` stays alive in this stack frame while
     // suspended, and the scheduler's queue holds it too.
     drop(next);
@@ -153,6 +203,22 @@ pub fn switch_to(next: Arc<Task>) {
     if were_enabled {
         interrupts::enable();
     }
+}
+
+/// Loads `space` (or the kernel's tables) into CR3 on this CPU. Runs on a kernel stack, which
+/// every address space maps.
+fn load_space(space: Option<&UserSpace>) {
+    let root = match space {
+        Some(space) => {
+            // Counted before loading, so a TLB shootdown cannot miss this CPU.
+            space.note_loaded();
+            space.root()
+        }
+        None => paging::kernel_root(),
+    };
+    // SAFETY: every address space maps the kernel half (shared with the kernel's tables), and
+    // the code and stack running now are in the kernel half.
+    unsafe { paging::write_cr3(root) };
 }
 
 /// Marks `task` as running on this CPU, first waiting until the CPU that ran it before has

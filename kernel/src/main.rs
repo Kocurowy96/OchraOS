@@ -19,6 +19,7 @@ mod banner;
 mod logger;
 mod sched;
 mod selftest;
+mod syscall;
 mod time;
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -104,6 +105,7 @@ fn main(boot: &'static BootInfo) -> ! {
 
     // From here on the kernel runs as tasks, each on its own stack with a guard page; the
     // boot stack (Limine's) is left behind.
+    syscall::init();
     selftest::spawn_tasks();
     // One idle task per CPU, so every CPU always has something to run.
     for _ in 0..smp::cpu_count() {

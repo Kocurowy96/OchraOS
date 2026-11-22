@@ -57,6 +57,46 @@ impl Frame {
         unsafe { pointer.write_volatile(value) }
     }
 
+    /// Copies `bytes` into the frame at `offset`. Panics if they do not fit.
+    pub fn write_bytes(&mut self, offset: usize, bytes: &[u8]) {
+        assert!(
+            offset
+                .checked_add(bytes.len())
+                .is_some_and(|end| end <= FRAME_SIZE as usize),
+            "{} bytes at offset {offset} do not fit into a frame",
+            bytes.len()
+        );
+        let pointer = direct_map(self.address).wrapping_add(offset);
+        // SAFETY: the range is inside the frame (checked above), which is RAM reachable through
+        // the direct map and owned by `self`; `&mut self` makes this the only access, and
+        // `bytes` cannot overlap it (safe code has no other reference into the frame).
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+    }
+
+    /// Copies bytes from the frame at `offset` into `buffer`. Panics if they do not fit.
+    pub fn read_bytes(&self, offset: usize, buffer: &mut [u8]) {
+        assert!(
+            offset
+                .checked_add(buffer.len())
+                .is_some_and(|end| end <= FRAME_SIZE as usize),
+            "{} bytes at offset {offset} do not fit into a frame",
+            buffer.len()
+        );
+        let pointer = direct_map(self.address).wrapping_add(offset);
+        // SAFETY: as in `write_bytes`; the frame is only read.
+        unsafe { core::ptr::copy_nonoverlapping(pointer, buffer.as_mut_ptr(), buffer.len()) };
+    }
+
+    /// Takes ownership of the frame at `address` again (the reverse of `into_address`).
+    ///
+    /// # Safety
+    ///
+    /// `address` must come from `into_address`, and the frame must not be owned by anything
+    /// else (no other `Frame`, no page table entry that is still used).
+    pub(crate) unsafe fn from_address(address: PhysAddr) -> Self {
+        Self { address }
+    }
+
     /// Gives up ownership without freeing the frame, e.g. because it became a page table or
     /// stack page that lives as long as the kernel. Returns its address.
     pub(crate) fn into_address(self) -> PhysAddr {

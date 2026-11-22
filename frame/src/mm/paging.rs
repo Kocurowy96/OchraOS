@@ -25,10 +25,11 @@
 //! - kernel stacks with an unmapped guard page below each, so an overflow faults instead of
 //!   silently overwriting other memory.
 //!
-//! Then it switches CR3. Nothing else (no user pages, no device memory) is mapped yet.
+//! Then it switches CR3. Device registers are mapped later ([`map_device`]); user address
+//! spaces (`mm::user`) share the kernel half of these tables.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use spin::Once;
 
@@ -38,20 +39,20 @@ use crate::arch::gdt;
 use crate::boot::{BootInfo, MemoryKind};
 use crate::sync::IrqMutex;
 
-const PRESENT: u64 = 1 << 0;
-const WRITABLE: u64 = 1 << 1;
-const USER: u64 = 1 << 2;
+pub(super) const PRESENT: u64 = 1 << 0;
+pub(super) const WRITABLE: u64 = 1 << 1;
+pub(super) const USER: u64 = 1 << 2;
 /// In a level-2 (or level-3) entry: maps a large page instead of pointing to a table.
 const HUGE: u64 = 1 << 7;
 /// Kept in the TLB across CR3 switches; for mappings shared by every address space.
 const GLOBAL: u64 = 1 << 8;
-const NO_EXECUTE: u64 = 1 << 63;
+pub(super) const NO_EXECUTE: u64 = 1 << 63;
 /// Write-through and cache-disable: together they make a page uncached, as device registers
 /// must be (a cached write might never reach the device).
 const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
 /// Bits 12..51 of an entry: the physical address of the next table or of the page.
-const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+pub(super) const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 const HUGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 
@@ -83,7 +84,7 @@ impl Access {
         user: false,
     };
 
-    fn entry_bits(self) -> u64 {
+    pub(super) fn entry_bits(self) -> u64 {
         let mut bits = PRESENT;
         if self.writable {
             bits |= WRITABLE;
@@ -140,38 +141,85 @@ impl AddressSpace {
     /// Walks from the PML4 down to the table at `level` (1 = PT, 2 = PD), creating missing
     /// tables, and returns a pointer to the entry for `virt` there.
     fn walk(&mut self, virt: u64, level: u32, user: bool) -> *mut u64 {
-        let mut table = self.root;
-        for current in (level + 1..=4).rev() {
-            let entry = entry_pointer(table, virt, current);
-            // SAFETY: `entry` points into a live page table frame of this address space, and
-            // the address space is only changed under the `KERNEL_SPACE` lock.
-            let value = unsafe { entry.read() };
-            if value & PRESENT == 0 {
-                let next = new_table();
-                self.tables += 1;
-                // Intermediate entries allow everything; the final entry restricts access.
-                let mut bits = PRESENT | WRITABLE;
-                if user {
-                    bits |= USER;
-                }
-                // SAFETY: as above.
-                unsafe { entry.write(next.0 | bits) };
-                table = next;
-            } else {
-                assert!(
-                    value & HUGE == 0,
-                    "mapping {virt:#x} inside an existing huge page"
-                );
-                if user && value & USER == 0 {
-                    // SAFETY: as above; adding USER to an intermediate entry only allows
-                    // what the final entries allow.
-                    unsafe { entry.write(value | USER) };
-                }
-                table = PhysAddr(value & ADDRESS_MASK);
-            }
-        }
-        entry_pointer(table, virt, level)
+        // The kernel half is shared by every user address space, which copied its PML4
+        // entries when it was created: a new one would be missing there.
+        let pml4_entry = entry_pointer(self.root, virt, 4);
+        // SAFETY: the PML4 is a live page table frame; only read.
+        let pml4_present = unsafe { pml4_entry.read() } & PRESENT != 0;
+        let kernel_half = virt >= 0xFFFF_8000_0000_0000;
+        assert!(
+            pml4_present || !kernel_half || !KERNEL_HALF_FROZEN.load(Ordering::Acquire),
+            "new kernel-half PML4 entry for {virt:#x} after user address spaces may exist"
+        );
+        let mut created = 0;
+        // SAFETY: the root is a live PML4 of this address space, changed only under its lock.
+        let entry = unsafe { walk(self.root, virt, level, Create::Yes { user }, &mut created) }
+            .expect("out of memory for page tables");
+        self.tables += created;
+        entry
     }
+}
+
+/// Whether [`walk`] may create missing tables.
+#[derive(Clone, Copy)]
+pub(super) enum Create {
+    No,
+    /// Yes; `user` also allows user access in the intermediate entries.
+    Yes {
+        user: bool,
+    },
+}
+
+/// Walks from the PML4 at `root` down to the table at `level` (1 = PT, 2 = PD) and returns a
+/// pointer to the entry for `virt` there. Missing tables are created (counted in `created`)
+/// or, with `Create::No`, make the walk return `None`; so does running out of memory.
+///
+/// # Safety
+///
+/// `root` must be a live PML4 whose tables nobody else changes during the walk.
+pub(super) unsafe fn walk(
+    root: PhysAddr,
+    virt: u64,
+    level: u32,
+    create: Create,
+    created: &mut u64,
+) -> Option<*mut u64> {
+    let mut table = root;
+    for current in (level + 1..=4).rev() {
+        let entry = entry_pointer(table, virt, current);
+        // SAFETY: `entry` points into a live page table frame (the caller's root, or a table
+        // found through it), and nobody else changes it (the caller's promise).
+        let value = unsafe { entry.read() };
+        if value & PRESENT == 0 {
+            let Create::Yes { user } = create else {
+                return None;
+            };
+            let mut frame = frames::allocate()?;
+            frame.zero();
+            let next = frame.into_address();
+            *created += 1;
+            // Intermediate entries allow everything; the final entry restricts access.
+            let mut bits = PRESENT | WRITABLE;
+            if user {
+                bits |= USER;
+            }
+            // SAFETY: as above.
+            unsafe { entry.write(next.0 | bits) };
+            table = next;
+        } else {
+            assert!(
+                value & HUGE == 0,
+                "walking to {virt:#x} through a huge page"
+            );
+            if matches!(create, Create::Yes { user: true }) && value & USER == 0 {
+                // SAFETY: as above; adding USER to an intermediate entry only allows what
+                // the final entries allow.
+                unsafe { entry.write(value | USER) };
+            }
+            table = PhysAddr(value & ADDRESS_MASK);
+        }
+    }
+    Some(entry_pointer(table, virt, level))
 }
 
 /// Writes a final (page-mapping) entry, refusing to silently replace an existing mapping.
@@ -187,21 +235,24 @@ unsafe fn set_entry(entry: *mut u64, value: u64, virt: u64) {
     unsafe { entry.write(value) };
 }
 
-/// Allocates and zeroes a frame for a page table. Page tables live as long as the kernel.
-fn new_table() -> PhysAddr {
+/// Allocates and zeroes a frame for a page table.
+pub(super) fn new_table() -> PhysAddr {
     let mut frame = frames::allocate().expect("out of memory for page tables");
     frame.zero();
     frame.into_address()
 }
 
 /// Pointer to the entry for `virt` in the table at physical address `table`, at `level`.
-fn entry_pointer(table: PhysAddr, virt: u64, level: u32) -> *mut u64 {
+pub(super) fn entry_pointer(table: PhysAddr, virt: u64, level: u32) -> *mut u64 {
     let index = (virt >> (12 + 9 * (level - 1))) & 0x1FF;
     direct_map(table).cast::<u64>().wrapping_add(index as usize)
 }
 
 /// The kernel's address space, after [`init`].
 static KERNEL_SPACE: Once<IrqMutex<AddressSpace>> = Once::new();
+/// Set once [`init`] has created every kernel-half PML4 entry the kernel will ever use; from
+/// then on user address spaces can copy them.
+static KERNEL_HALF_FROZEN: AtomicBool = AtomicBool::new(false);
 
 /// Where kernel stacks go: PML4 slot 509, far from the kernel image (slot 511) and the direct
 /// map (Limine puts it in the lower slots of the higher half). The heap uses slot 508.
@@ -324,6 +375,14 @@ pub fn init(boot: &BootInfo) -> Report {
         );
     }
 
+    // The regions the kernel fills later (heap, stacks, devices) get their PML4 entries now,
+    // so the kernel half never gains a PML4 entry again (see `KERNEL_HALF_FROZEN`).
+    for base in [KERNEL_REGIONS_BASE, STACKS_BASE, DEVICES_BASE] {
+        space.walk(base, 3, false);
+    }
+    KERNEL_HALF_FROZEN.store(true, Ordering::Release);
+    super::tlb::init();
+
     let root = space.root;
     report.page_tables = space.tables;
     KERNEL_SPACE.call_once(|| IrqMutex::new(space));
@@ -379,6 +438,11 @@ pub(crate) fn map_new_pages(start: u64, pages: u64) -> Option<()> {
         );
     }
     Some(())
+}
+
+/// The physical address of the kernel's PML4.
+pub(crate) fn kernel_root() -> PhysAddr {
+    kernel_space().lock().root
 }
 
 fn kernel_space() -> &'static IrqMutex<AddressSpace> {
@@ -440,7 +504,7 @@ fn translate_current(virt: u64) -> Option<PhysAddr> {
     None
 }
 
-fn read_cr3() -> u64 {
+pub(super) fn read_cr3() -> u64 {
     let value;
     // SAFETY: reading CR3 has no side effects.
     unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack, preserves_flags)) };
@@ -450,7 +514,7 @@ fn read_cr3() -> u64 {
 /// # Safety
 ///
 /// `root` must be a PML4 that maps everything the kernel touches from now on.
-unsafe fn write_cr3(root: PhysAddr) {
+pub(crate) unsafe fn write_cr3(root: PhysAddr) {
     // SAFETY: guaranteed by the caller. Writing CR3 also flushes the TLB (except global pages).
     unsafe { asm!("mov cr3, {}", in(reg) root.0, options(nostack, preserves_flags)) };
 }

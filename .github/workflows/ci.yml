@@ -68,6 +68,7 @@ jobs:
           name: logs
           path: |
             build/test-*.log
+            build/failed/*.log
             build/limine/build.log
           if-no-files-found: ignore
 

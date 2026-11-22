@@ -35,7 +35,7 @@ pub fn set_handler(vector: u8, handler: Handler) {
 }
 
 /// Called from the common entry path for vectors 32–255.
-pub(super) fn dispatch(frame: &ExceptionFrame) {
+pub(crate) fn dispatch(frame: &ExceptionFrame) {
     let vector = frame.vector() as u8;
     if vector == apic::SPURIOUS_VECTOR {
         // A spurious interrupt is not a real one: no handler, and no end-of-interrupt.

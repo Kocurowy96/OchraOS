@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! Memory management: physical frames now; page tables and the kernel heap next.
+//! Memory management: physical frames, page tables (kernel and user), the kernel heap.
 //!
 //! Physical memory is split into 4 KiB "frames". Before we have our own page tables we reach
 //! physical memory through Limine's direct map (HHDM): physical address `p` is visible at
@@ -9,6 +9,8 @@
 pub mod frames;
 pub mod heap;
 pub mod paging;
+pub mod tlb;
+pub mod user;
 
 use spin::Once;
 

@@ -37,6 +37,9 @@ pub fn run(name: &str) {
         "smap" => crash::smap(),
         // Runs as a task once the scheduler starts.
         "taskstack" => crate::sched::spawn("overflow", overflow_task_stack),
+        // User programs that must be killed, while the kernel carries on.
+        "userkernel" => spawn_user_program("kernel"),
+        "userhlt" => spawn_user_program("hlt"),
         // Cpu 1 is waiting for this signal, see `on_ap`.
         "apdoublefault" => AP_DOUBLE_FAULT_GO.store(true, core::sync::atomic::Ordering::Release),
         _ => log::error!("unknown self-test {name:?}"),
@@ -73,6 +76,7 @@ pub fn run_checks() {
     check_cpus();
     check_interrupts();
     check_timer();
+    check_user_space();
 }
 
 /// Runs every check. Without the `selftest` feature it does nothing.
@@ -310,6 +314,37 @@ pub fn spawn_tasks() {
     }
     crate::sched::spawn("A", task_a);
     crate::sched::spawn("B", task_b);
+    spawn_user_program("hello");
+}
+
+/// Spawns the ring 3 test program `name` (see `ochra_frame::selftest::user_program`) in a new
+/// address space: its code at 4 MiB (read and execute), one stack page at the top of the
+/// user half.
+#[cfg(feature = "selftest")]
+fn spawn_user_program(name: &'static str) {
+    use alloc::sync::Arc;
+    use ochra_frame::mm::frames;
+    use ochra_frame::mm::user::{USER_END, UserAccess, UserSpace};
+
+    const CODE: u64 = 0x40_0000;
+    let space = UserSpace::new().expect("out of memory");
+    let mut code = frames::allocate().expect("out of memory");
+    code.zero();
+    code.write_bytes(0, ochra_frame::selftest::user_program(name));
+    let executable = UserAccess {
+        writable: false,
+        executable: true,
+    };
+    let writable = UserAccess {
+        writable: true,
+        executable: false,
+    };
+    let mut stack = frames::allocate().expect("out of memory");
+    stack.zero();
+    let stack_page = USER_END - 4096;
+    assert!(space.map(CODE, code, executable).is_ok());
+    assert!(space.map(stack_page, stack, writable).is_ok());
+    crate::sched::spawn_user(name, Arc::new(space), CODE, USER_END);
 }
 
 /// Without self-tests there are no test tasks.
@@ -405,4 +440,98 @@ pub fn on_ap(index: u32) {
         }
         ochra_frame::selftest::double_fault();
     }
+}
+
+/// User address spaces: mapping, permissions, unmapping and freeing; every frame (pages and
+/// page tables) comes back. Then a TLB shootdown that every other CPU must answer.
+#[cfg(feature = "selftest")]
+fn check_user_space() {
+    use ochra_frame::mm::frames;
+    use ochra_frame::mm::user::{MapError, USER_END, UserAccess, UserSpace};
+
+    const BASE: u64 = 0x40_0000;
+    let read_write = UserAccess {
+        writable: true,
+        executable: false,
+    };
+    let before = frames::stats();
+    {
+        let space = UserSpace::new().expect("self-test user space: out of memory");
+        for page in 0..3u64 {
+            let mut frame = frames::allocate().expect("out of memory");
+            frame.write_u64(0, 0x0C4A_0000 + page);
+            let address = frame.address();
+            let virt = BASE + page * 4096;
+            assert!(
+                space.map(virt, frame, read_write).is_ok(),
+                "self-test user space: map"
+            );
+            assert_eq!(
+                space.translate(virt),
+                Some((address, read_write)),
+                "self-test user space: translate"
+            );
+        }
+        let spare = frames::allocate().expect("out of memory");
+        let (error, spare) = space.map(BASE, spare, read_write).unwrap_err();
+        assert_eq!(
+            error,
+            MapError::AlreadyMapped,
+            "self-test user space: double map"
+        );
+        let (error, _spare) = space.map(USER_END, spare, read_write).unwrap_err();
+        assert_eq!(
+            error,
+            MapError::BadAddress,
+            "self-test user space: kernel half"
+        );
+
+        let read_only = UserAccess {
+            writable: false,
+            executable: false,
+        };
+        assert_eq!(
+            space.protect(BASE, 4, read_only),
+            3,
+            "self-test user space: protect"
+        );
+        assert_eq!(
+            space.translate(BASE).map(|(_, access)| access),
+            Some(read_only)
+        );
+
+        let unmapped = space.unmap(BASE, 4);
+        assert_eq!(unmapped.len(), 3, "self-test user space: unmap");
+        for (page, frame) in unmapped.iter().enumerate() {
+            assert_eq!(
+                frame.read_u64(0),
+                0x0C4A_0000 + page as u64,
+                "self-test user space"
+            );
+        }
+        assert_eq!(
+            space.translate(BASE),
+            None,
+            "self-test user space: still mapped"
+        );
+
+        // Mapped again and left mapped: dropping the space must free it with its tables.
+        let frame = frames::allocate().expect("out of memory");
+        assert!(space.map(0x7FFF_FFFF_F000, frame, read_write).is_ok());
+    }
+    assert_eq!(
+        frames::stats(),
+        before,
+        "self-test user space: frames leaked"
+    );
+
+    let others = ochra_frame::smp::cpu_count() - 1;
+    let answered = ochra_frame::mm::tlb::broadcast_test();
+    assert_eq!(
+        answered, others,
+        "self-test user space: TLB shootdown answers"
+    );
+    log::info!(
+        "self-test user space: ok (map, protect, unmap, free; shootdown answered by {answered} CPUs)"
+    );
 }
