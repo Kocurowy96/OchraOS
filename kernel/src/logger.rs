@@ -7,7 +7,7 @@
 //! to COM1, one coloured line per message:
 //!
 //! ```text
-//! [INFO ] kernel::boot: message
+//! [INFO  cpu0] kernel::boot: message
 //! ```
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -52,8 +52,9 @@ impl Log for SerialLogger {
         };
         // `{:<5}` pads the level name to 5 characters, so the messages line up.
         println!(
-            "{color}[{:<5}]{RESET} {GREY}{}:{RESET} {}",
+            "{color}[{:<5} cpu{}]{RESET} {GREY}{}:{RESET} {}",
             record.level(),
+            ochra_frame::cpu_local::cpu_index(),
             record.target(),
             record.args()
         );

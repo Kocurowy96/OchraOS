@@ -49,6 +49,8 @@ pub fn command(image: &Path) -> Result<Command> {
     qemu.args(["-machine", "q35", "-m", "256M"])
         // `max`: every CPU feature the accelerator can offer (we will want SMEP/SMAP later).
         .args(["-cpu", "max"])
+        // Four cores, so SMP code always runs on more than one.
+        .args(["-smp", "4"])
         // Hardware virtualisation if available, otherwise plain emulation.
         .args(["-accel", "kvm", "-accel", "tcg"])
         .arg("-drive")

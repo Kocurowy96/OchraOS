@@ -19,8 +19,11 @@
 //! The layout follows Linux (`arch/x86/include/asm/segment.h`), because user programs can see
 //! selector values (e.g. Wine checks CS = 0x23 / 0x33 for 32/64-bit code).
 //!
-//! For now there is one GDT and one TSS; with SMP (stage 1) every CPU gets its own.
+//! Every CPU has its own GDT and TSS ([`CpuTables`]): a TSS holds that CPU's interrupt
+//! stacks, and the CPU marks a loaded TSS as busy, so two CPUs cannot share one. The boot CPU
+//! uses a static copy (it is needed before the heap exists); every AP allocates its own.
 
+use alloc::boxed::Box;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
@@ -49,29 +52,82 @@ const ENTRIES: usize = 10;
 const KERNEL_CODE_DESCRIPTOR: u64 = 0x00AF_9B00_0000_FFFF;
 const KERNEL_DATA_DESCRIPTOR: u64 = 0x00CF_9300_0000_FFFF;
 
-/// The GDT itself. The entries are atomics only because the CPU writes into the table:
-/// `ltr` sets the "busy" bit in the TSS descriptor. With a plain array Rust would assume the
-/// memory never changes (and could even put it in read-only memory).
-static GDT: [AtomicU64; ENTRIES] = [const { AtomicU64::new(0) }; ENTRIES];
+/// One CPU's GDT and TSS.
+struct CpuTables {
+    /// The entries are atomics only because the CPU writes into the table: `ltr` sets the
+    /// "busy" bit in the TSS descriptor. With a plain array Rust would assume the memory never
+    /// changes (and could even put it in read-only memory).
+    gdt: [AtomicU64; ENTRIES],
+    /// The CPU reads the TSS on its own (on every interrupt that switches stacks), while the
+    /// kernel occasionally changes a stack pointer in it.
+    tss: UnsafeCell<TaskStateSegment>,
+}
 
-static TSS: Tss = Tss(UnsafeCell::new(TaskStateSegment {
-    _reserved_1: 0,
-    privilege_stacks: [0; 3],
-    _reserved_2: 0,
-    interrupt_stacks: [0; 7],
-    _reserved_3: 0,
-    _reserved_4: 0,
-    io_map_base: size_of::<TaskStateSegment>() as u16,
-}));
+// SAFETY: each `CpuTables` belongs to one CPU: only that CPU loads it, and its TSS is written
+// only before it is loaded or, through `set_interrupt_stack`, by the boot CPU on its own copy.
+// Other CPUs never touch it.
+unsafe impl Sync for CpuTables {}
 
-/// The TSS, which the CPU reads on its own (on every interrupt that switches stacks), while
-/// the kernel occasionally changes a stack pointer in it.
-#[repr(transparent)]
-struct Tss(UnsafeCell<TaskStateSegment>);
+impl CpuTables {
+    const fn new() -> Self {
+        Self {
+            gdt: [const { AtomicU64::new(0) }; ENTRIES],
+            tss: UnsafeCell::new(TaskStateSegment {
+                _reserved_1: 0,
+                privilege_stacks: [0; 3],
+                _reserved_2: 0,
+                interrupt_stacks: [0; 7],
+                _reserved_3: 0,
+                _reserved_4: 0,
+                io_map_base: size_of::<TaskStateSegment>() as u16,
+            }),
+        }
+    }
 
-// SAFETY: there is one TSS for the one CPU in use; its fields are only written by
-// `set_interrupt_stack`, on that CPU. (With SMP every CPU gets its own TSS.)
-unsafe impl Sync for Tss {}
+    /// Fills in the descriptors, the TSS one pointing to this structure's TSS.
+    fn fill(&self) {
+        let (tss_low, tss_high) = tss_descriptor(self.tss.get() as u64);
+        let gdt = &self.gdt;
+        gdt[usize::from(KERNEL_CODE / 8)].store(KERNEL_CODE_DESCRIPTOR, Ordering::Relaxed);
+        gdt[usize::from(KERNEL_DATA / 8)].store(KERNEL_DATA_DESCRIPTOR, Ordering::Relaxed);
+        gdt[usize::from(TSS_SELECTOR / 8)].store(tss_low, Ordering::Relaxed);
+        gdt[usize::from(TSS_SELECTOR / 8) + 1].store(tss_high, Ordering::Relaxed);
+    }
+
+    /// Points IST entry `ist` (1–7, as in the IDT) at a new stack top.
+    ///
+    /// # Safety
+    ///
+    /// `top` must be the top of a mapped, writable stack that stays valid for as long as the
+    /// IST entry points to it and that nothing else uses. Only the CPU owning these tables may
+    /// call this once they are loaded.
+    unsafe fn set_interrupt_stack(&self, ist: u8, top: u64) {
+        let index = usize::from(ist) - 1;
+        assert!(index < 7, "IST index {ist} out of range 1..=7");
+        // SAFETY: `self.tss.get()` points to a live TSS, so the field pointer is valid; the
+        // TSS is packed, so its fields may be unaligned, hence a raw pointer and
+        // `write_unaligned` instead of a reference. `index < 7` keeps the write inside
+        // `interrupt_stacks`. Only the owning CPU writes it, and the CPU reads the entry only
+        // when delivering an exception through it; the caller vouches for the stack.
+        unsafe {
+            let entries = addr_of_mut!((*self.tss.get()).interrupt_stacks).cast::<u64>();
+            entries.add(index).write_unaligned(top);
+        }
+    }
+
+    /// Loads the GDT and the TSS into this CPU.
+    fn load(&'static self) {
+        load_segments(&self.gdt);
+        // SAFETY: TSS_SELECTOR points to the valid, not yet busy TSS descriptor filled in by
+        // `fill`; the TSS it describes lives for ever (`'static`).
+        unsafe {
+            asm!("ltr {0:x}", in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// The boot CPU's tables.
+static BOOT_TABLES: CpuTables = CpuTables::new();
 
 /// Size of the boot-time interrupt stack.
 const IST_STACK_SIZE: usize = 16 * 1024;
@@ -121,24 +177,34 @@ pub struct DescriptorTablePointer {
     pub base: u64,
 }
 
-/// Fills in the GDT and TSS, then loads them into this CPU.
+/// Fills in the boot CPU's GDT and TSS, then loads them. Call once, on the boot CPU.
 pub fn init() {
     // SAFETY: the TSS is not loaded yet, so the CPU does not read it, and nothing else writes
-    // it (`init` runs once, on the boot CPU).
-    unsafe { set_interrupt_stack(DOUBLE_FAULT_IST, BOOT_DOUBLE_FAULT_STACK.top()) };
-    let (tss_low, tss_high) = tss_descriptor();
+    // it (`init` runs once, on the boot CPU); the boot stack is a static used only here.
+    unsafe { BOOT_TABLES.set_interrupt_stack(DOUBLE_FAULT_IST, BOOT_DOUBLE_FAULT_STACK.top()) };
+    BOOT_TABLES.fill();
+    BOOT_TABLES.load();
+}
 
-    GDT[usize::from(KERNEL_CODE / 8)].store(KERNEL_CODE_DESCRIPTOR, Ordering::Relaxed);
-    GDT[usize::from(KERNEL_DATA / 8)].store(KERNEL_DATA_DESCRIPTOR, Ordering::Relaxed);
-    GDT[usize::from(TSS_SELECTOR / 8)].store(tss_low, Ordering::Relaxed);
-    GDT[usize::from(TSS_SELECTOR / 8) + 1].store(tss_high, Ordering::Relaxed);
+/// Creates and loads the GDT and TSS of an AP, with `double_fault_stack` (a stack top) for
+/// double faults. Call once on every AP.
+pub(crate) fn init_ap(double_fault_stack: u64) {
+    let tables: &'static CpuTables = Box::leak(Box::new(CpuTables::new()));
+    // SAFETY: the new TSS is not loaded yet; the caller passes a stack that lives for ever
+    // and is used only by this CPU's double fault handler.
+    unsafe { tables.set_interrupt_stack(DOUBLE_FAULT_IST, double_fault_stack) };
+    tables.fill();
+    tables.load();
+}
 
+/// Loads `gdt` and reloads every segment register with its kernel selector.
+fn load_segments(gdt: &'static [AtomicU64; ENTRIES]) {
     let pointer = DescriptorTablePointer {
         limit: (size_of::<[AtomicU64; ENTRIES]>() - 1) as u16,
-        base: GDT.as_ptr() as u64,
+        base: gdt.as_ptr() as u64,
     };
 
-    // SAFETY: the GDT is a static, so it stays valid forever, and it holds valid kernel code
+    // SAFETY: the GDT lives forever (`'static`), and it holds valid kernel code
     // and data descriptors at the selectors loaded below. Reloading CS needs a far return:
     // we push the new CS and the address of label 2, and `retfq` pops both. The data segment
     // registers get the kernel data selector; FS and GS get the null selector (their bases
@@ -163,38 +229,21 @@ pub fn init() {
             tmp = out(reg) _,
         );
     }
-
-    // SAFETY: TSS_SELECTOR points to a valid, not yet busy TSS descriptor, and the TSS it
-    // describes is a static that lives forever.
-    unsafe {
-        asm!("ltr {0:x}", in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
-    }
 }
 
-/// Points IST entry `ist` (1–7, as in the IDT) at a new stack top.
+/// Points IST entry `ist` of the boot CPU's TSS at a new stack top.
 ///
 /// # Safety
 ///
-/// `top` must be the top of a mapped, writable stack that stays valid for as long as the IST
-/// entry points to it and that nothing else uses. Must run on the CPU that owns the TSS.
+/// As for [`CpuTables::set_interrupt_stack`]; must run on the boot CPU.
 pub(crate) unsafe fn set_interrupt_stack(ist: u8, top: u64) {
-    let index = usize::from(ist) - 1;
-    assert!(index < 7, "IST index {ist} out of range 1..=7");
-    // SAFETY: `TSS.0.get()` points to the static TSS, so the field pointer is valid; the TSS is
-    // packed, so its fields may be unaligned, hence a raw pointer and `write_unaligned`
-    // instead of a reference. `index < 7` keeps the write inside `interrupt_stacks`. The TSS
-    // is only written on this CPU, and the CPU reads the entry only when delivering an
-    // exception through this IST entry; the caller vouches for the stack itself.
-    unsafe {
-        let entries = addr_of_mut!((*TSS.0.get()).interrupt_stacks).cast::<u64>();
-        entries.add(index).write_unaligned(top);
-    }
+    // SAFETY: guaranteed by the caller.
+    unsafe { BOOT_TABLES.set_interrupt_stack(ist, top) };
 }
 
 /// Builds the two 64-bit halves of a TSS descriptor ("system segment", 16 bytes long,
 /// because a 64-bit base does not fit into a normal 8-byte descriptor).
-fn tss_descriptor() -> (u64, u64) {
-    let base = TSS.0.get() as u64;
+fn tss_descriptor(base: u64) -> (u64, u64) {
     let limit = (size_of::<TaskStateSegment>() - 1) as u64;
     // 0x89 = present, ring 0, type 9 ("available 64-bit TSS").
     let access: u64 = 0x89;

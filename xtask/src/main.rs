@@ -22,16 +22,31 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  build          build the kernel and the bootable image
-  run            boot in QEMU (UEFI via OVMF), serial output in the terminal
-  test           boot in QEMU headless and check the serial log
-  check-unsafe   fail if `unsafe` appears in code outside frame/";
+  build [--release]  build the kernel and the bootable image
+  run [--release]    boot in QEMU (UEFI via OVMF), serial output in the terminal
+  test               boot in QEMU headless and check the serial log
+  check-unsafe       fail if `unsafe` appears in code outside frame/
+
+--release builds an optimised kernel without debug output (no addresses in the log).";
 
 fn main() -> ExitCode {
-    let command = std::env::args().nth(1);
-    let result = match command.as_deref() {
-        Some("build") => build().map(|_| ()),
-        Some("run") => build().and_then(|image| qemu::run(&image)),
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let command = arguments.first().map(String::as_str);
+    let profile = match arguments.get(1).map(String::as_str) {
+        None => Profile::Debug,
+        Some("--release") if matches!(command, Some("build" | "run")) => Profile::Release,
+        Some(_) => {
+            eprintln!("{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if arguments.len() > 2 {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
+    }
+    let result = match command {
+        Some("build") => build(profile).map(|_| ()),
+        Some("run") => build(profile).and_then(|image| qemu::run(&image)),
         Some("test") => test::run(),
         Some("check-unsafe") => check_unsafe::run(),
         _ => {
@@ -48,18 +63,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// Which cargo profile the kernel is built with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    Debug,
+    Release,
+}
+
 /// Builds the kernel, Limine and the boot image `build/ochraos.img`. Returns the image path.
-fn build() -> Result<PathBuf> {
-    let kernel = build_kernel(&[])?;
+fn build(profile: Profile) -> Result<PathBuf> {
+    let kernel = build_kernel(&[], profile)?;
     let bootloader = limine::build(&build_dir()?)?;
     let image = build_dir()?.join("ochraos.img");
     image::create(&image, &kernel, &bootloader, "")?;
     Ok(image)
 }
 
-/// Compiles the kernel crate for bare metal (debug profile) with the given cargo features
-/// and returns the path of the ELF file.
-fn build_kernel(features: &[&str]) -> Result<PathBuf> {
+/// Compiles the kernel crate for bare metal with the given cargo features and returns the
+/// path of the ELF file.
+fn build_kernel(features: &[&str], profile: Profile) -> Result<PathBuf> {
     step("building the kernel");
     // `cargo xtask` runs under cargo, which tells us which cargo binary it is.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
@@ -74,8 +96,18 @@ fn build_kernel(features: &[&str]) -> Result<PathBuf> {
     if !features.is_empty() {
         command.arg("--features").arg(features.join(","));
     }
+    let directory = match profile {
+        Profile::Debug => "debug",
+        Profile::Release => {
+            command.arg("--release");
+            "release"
+        }
+    };
     run(&mut command)?;
-    Ok(root().join("target/x86_64-unknown-none/debug/kernel"))
+    Ok(root()
+        .join("target/x86_64-unknown-none")
+        .join(directory)
+        .join("kernel"))
 }
 
 /// `build/` in the repository root, created if needed.

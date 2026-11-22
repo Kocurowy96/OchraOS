@@ -49,8 +49,9 @@ impl SerialPort {
     /// # Safety
     ///
     /// `base` must be the I/O base of a 16550-compatible UART that nothing else drives.
-    /// The one exception is the panic handler, which may create a second writer for COM1:
-    /// the worst outcome is mixed-up characters, the machine stops right after.
+    /// The one exception is [`emergency_writer`] (panics and fatal exceptions), which may
+    /// write to COM1 without its lock: the worst outcome is mixed-up characters, and the CPU
+    /// stops right after.
     pub const unsafe fn new(base: u16) -> Self {
         Self { base }
     }
@@ -111,11 +112,39 @@ impl fmt::Write for SerialPort {
     }
 }
 
-/// Writer for the panic handler: it does not take the `COM1` lock, which may be held by the
-/// code that panicked (e.g. a panic inside `println!`) and would never be released.
-pub fn emergency_writer() -> SerialPort {
+/// How often [`emergency_writer`] tries to take the `COM1` lock before writing without it.
+/// Long enough for another CPU to finish a line, short enough not to matter when the lock
+/// will never come free.
+const EMERGENCY_LOCK_ATTEMPTS: u32 = 10_000_000;
+
+/// Writer for the panic handler and fatal exceptions.
+///
+/// It takes the `COM1` lock if it can, so the report does not mix with lines another CPU is
+/// printing, and keeps it: the CPU stops after the report, and output from the others would
+/// only bury it. If the lock does not come free, the code that crashed may hold it itself
+/// (e.g. a panic inside `println!`) and it would never be released, so it writes without it.
+pub fn emergency_writer() -> EmergencyWriter {
+    let guard = (0..EMERGENCY_LOCK_ATTEMPTS).find_map(|_| {
+        let guard = COM1.try_lock();
+        if guard.is_none() {
+            core::hint::spin_loop();
+        }
+        guard
+    });
+    if let Some(guard) = guard {
+        core::mem::forget(guard);
+    }
     // SAFETY: this is the documented exception in `SerialPort::new`.
-    unsafe { SerialPort::new(COM1_BASE) }
+    EmergencyWriter(unsafe { SerialPort::new(COM1_BASE) })
+}
+
+/// See [`emergency_writer`].
+pub struct EmergencyWriter(SerialPort);
+
+impl fmt::Write for EmergencyWriter {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0.write_str(text)
+    }
 }
 
 /// Used by `print!` and `println!`; not meant to be called directly.

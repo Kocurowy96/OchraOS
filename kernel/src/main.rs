@@ -26,6 +26,7 @@ use ochra_frame::BootInfo;
 use ochra_frame::arch::{self, apic, exceptions, interrupts, pic};
 use ochra_frame::boot::MemoryKind;
 use ochra_frame::mm::{FRAME_SIZE, frames, heap, paging};
+use ochra_frame::smp::{self, CpuInfo};
 
 ochra_frame::entry!(main);
 
@@ -63,6 +64,14 @@ fn main(boot: &'static BootInfo) -> ! {
     let heap = heap::init();
     info!("heap: {} KiB mapped, grows on demand", heap.mapped / 1024);
 
+    selftest::prepare(command_line);
+    smp::init_boot_cpu();
+    let others = smp::start_other_cpus(ap_main);
+    info!(
+        "smp: {} CPUs, {others} started besides the boot CPU",
+        smp::cpu_count()
+    );
+
     let local_apic = apic::init();
     pic::disable();
     info!(
@@ -93,6 +102,17 @@ fn main(boot: &'static BootInfo) -> ! {
     selftest::spawn_tasks();
     sched::spawn("idle", idle);
     sched::start();
+}
+
+/// Where the other CPUs (APs) arrive once their CPU state is set up. For now they stop here;
+/// they join the scheduler later in stage 1.5.
+fn ap_main(cpu: CpuInfo) -> ! {
+    info!(
+        "cpu {} online (APIC id {}), CPU protections: {}",
+        cpu.index, cpu.apic_id, cpu.protections
+    );
+    selftest::on_ap(cpu.index);
+    arch::halt_forever();
 }
 
 /// Runs when no other task has work: sleeps until the next interrupt.

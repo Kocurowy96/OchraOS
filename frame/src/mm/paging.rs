@@ -344,6 +344,15 @@ pub fn init(boot: &BootInfo) -> Report {
     report
 }
 
+/// Switches this CPU to the kernel's page tables (for APs; the BSP switches in [`init`]).
+pub(crate) fn activate_kernel_space() {
+    let root = kernel_space().lock().root;
+    // SAFETY: the kernel's tables map the kernel image, the direct map (with Limine's AP stack
+    // and CPU structures, in bootloader-reclaimable memory) at the same addresses as Limine's
+    // tables, so the code running now keeps working.
+    unsafe { write_cr3(root) };
+}
+
 /// Maps `pages` pages of device registers starting at `physical`, uncached, and returns the
 /// virtual address.
 pub(crate) fn map_device(physical: PhysAddr, pages: u64) -> u64 {

@@ -45,6 +45,17 @@ on every core.
 
 **Done when:** tasks run on more than one core in QEMU with `-smp 4`.
 
+Checklist:
+- [x] APs started through the Limine MP request; each loads the kernel page tables and
+      switches on SMEP/SMAP/UMIP/WP
+- [x] per-CPU data through the GS base (CPU index, APIC ID, current task) + self-test
+- [x] own GDT, TSS and double fault stack (with a guard page) on every CPU + crash test
+- [ ] local APIC and timer on every CPU (calibrated once)
+- [ ] a panic or fatal exception stops every CPU
+- [ ] scheduler on every CPU (one global run queue, an idle task per CPU)
+- [ ] boot test: tasks run on at least two CPUs (order and set only, never timing); a
+      single-CPU boot still works
+
 ## Stage 2 — Linux ABI
 
 `syscall` entry with Linux numbering, ELF loader with auxv, Ring 3, signals, initramfs (cpio).

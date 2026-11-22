@@ -25,11 +25,13 @@ compile_error!("the `selftest` feature must never be enabled in a release build"
 pub mod arch;
 pub mod boot;
 pub mod color;
+pub mod cpu_local;
 pub mod mm;
 mod panic;
 #[cfg(feature = "selftest")]
 pub mod selftest;
 pub mod serial;
+pub mod smp;
 pub mod sync;
 pub mod task;
 

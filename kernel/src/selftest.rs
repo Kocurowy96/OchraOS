@@ -37,6 +37,8 @@ pub fn run(name: &str) {
         "smap" => crash::smap(),
         // Runs as a task once the scheduler starts.
         "taskstack" => crate::sched::spawn("overflow", overflow_task_stack),
+        // Cpu 1 is waiting for this signal, see `on_ap`.
+        "apdoublefault" => AP_DOUBLE_FAULT_GO.store(true, core::sync::atomic::Ordering::Release),
         _ => log::error!("unknown self-test {name:?}"),
     }
 }
@@ -68,6 +70,7 @@ pub fn run(name: &str) {
 pub fn run_checks() {
     check_frames();
     check_heap();
+    check_cpus();
     check_interrupts();
     check_timer();
 }
@@ -314,4 +317,86 @@ pub fn tasks_finished() -> bool {
     return TASKS_DONE.load(core::sync::atomic::Ordering::Acquire) == 2;
     #[cfg(not(feature = "selftest"))]
     true
+}
+
+/// One bit per CPU that reported in through [`cpu_arrived`] (at most 64 CPUs in this test).
+#[cfg(feature = "selftest")]
+static CPUS_ARRIVED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Called by every AP when it reaches the kernel: records the CPU index read through its own
+/// per-CPU data (GS), which must match the one it was given.
+#[cfg(feature = "selftest")]
+pub fn cpu_arrived(index: u32) {
+    use core::sync::atomic::Ordering;
+    let own = ochra_frame::cpu_local::cpu_index();
+    assert_eq!(
+        own, index,
+        "self-test cpus: per-CPU data of cpu {index} says {own}"
+    );
+    let bit = 1 << own;
+    let before = CPUS_ARRIVED.fetch_or(bit, Ordering::AcqRel);
+    assert!(
+        before & bit == 0,
+        "self-test cpus: cpu {own} reported twice"
+    );
+}
+
+#[cfg(not(feature = "selftest"))]
+pub fn cpu_arrived(_index: u32) {}
+
+/// Per-CPU data: every CPU reports its own index exactly once, the boot CPU included.
+#[cfg(feature = "selftest")]
+fn check_cpus() {
+    use core::sync::atomic::Ordering;
+    use ochra_frame::smp;
+
+    cpu_arrived(0);
+    let count = smp::cpu_count();
+    assert!(count <= 64, "self-test cpus: more than 64 CPUs");
+    let all = u64::MAX >> (64 - count);
+    // The APs are online, but may not have reached `cpu_arrived` yet. Spinning is enough:
+    // the timer is not running yet, and each AP needs only a few instructions more.
+    let mut spins: u64 = 0;
+    while CPUS_ARRIVED.load(Ordering::Acquire) != all {
+        spins += 1;
+        assert!(spins < 1 << 32, "self-test cpus: not every CPU reported in");
+        core::hint::spin_loop();
+    }
+    log::info!("self-test cpus: ok ({count} CPUs, each found its own per-CPU data)");
+}
+
+/// Set by `test=apdoublefault` before the APs start: cpu 1 will raise a double fault, which
+/// checks that every AP has its own TSS and double fault stack.
+#[cfg(feature = "selftest")]
+static AP_DOUBLE_FAULT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Set by `run("apdoublefault")`, after the boot checks: the moment for cpu 1 to fault (the
+/// crash report keeps the serial port, so nothing is logged after it).
+#[cfg(feature = "selftest")]
+static AP_DOUBLE_FAULT_GO: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Looks at the command line for tests that must be armed before the APs start.
+#[cfg(feature = "selftest")]
+pub fn prepare(command_line: &str) {
+    if command_line
+        .split_whitespace()
+        .any(|argument| argument == "test=apdoublefault")
+    {
+        AP_DOUBLE_FAULT.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(feature = "selftest"))]
+pub fn prepare(_command_line: &str) {}
+
+/// Called by every AP when it reaches the kernel.
+pub fn on_ap(index: u32) {
+    cpu_arrived(index);
+    #[cfg(feature = "selftest")]
+    if index == 1 && AP_DOUBLE_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
+        while !AP_DOUBLE_FAULT_GO.load(core::sync::atomic::Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        ochra_frame::selftest::double_fault();
+    }
 }

@@ -16,8 +16,9 @@ use limine::BaseRevision;
 use limine::memory_map::EntryType;
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, HhdmRequest,
-    MemoryMapRequest, RequestsEndMarker, RequestsStartMarker,
+    MemoryMapRequest, MpRequest, RequestsEndMarker, RequestsStartMarker,
 };
+use limine::response::MpResponse;
 
 use crate::arch::halt_forever;
 use crate::color::{RED, RESET};
@@ -60,6 +61,12 @@ static EXECUTABLE_ADDRESS: ExecutableAddressRequest = ExecutableAddressRequest::
 #[unsafe(link_section = ".requests")]
 static HHDM: HhdmRequest = HhdmRequest::new();
 
+/// Start the other CPU cores and let us tell each one where to jump (see `smp`). Without
+/// this request Limine leaves them asleep.
+#[used]
+#[unsafe(link_section = ".requests")]
+static MP: MpRequest = MpRequest::new();
+
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
 static REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
@@ -97,6 +104,11 @@ extern "C" fn kmain() -> ! {
         }
     }
     __ochra_kernel_main(&BOOT_INFO);
+}
+
+/// Limine's list of CPUs, if it started the other cores.
+pub(crate) fn mp_response() -> Option<&'static MpResponse> {
+    MP.get_response()
 }
 
 /// Defines the kernel's entry point: `ochra_frame::entry!(main);` makes `kmain` call

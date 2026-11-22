@@ -253,6 +253,7 @@ fn report(frame: &ExceptionFrame) {
         "\n{RED}{BOLD}CPU EXCEPTION: {name} (#{mnemonic}, vector {}){RESET}",
         frame.vector
     );
+    let _ = writeln!(out, "  on cpu {}", crate::cpu_local::cpu_index());
 
     match frame.vector {
         PAGE_FAULT => {

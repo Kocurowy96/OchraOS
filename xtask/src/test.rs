@@ -16,7 +16,7 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::{Result, build_dir, build_kernel, image, limine, qemu, step};
+use crate::{Profile, Result, build_dir, build_kernel, image, limine, qemu, step};
 
 struct Case {
     name: &'static str,
@@ -44,6 +44,7 @@ const BOOT: &[&str] = &[
     "timer: local APIC timer at 100 Hz",
     "self-test frames: ok",
     "self-test heap: ok",
+    "self-test cpus: ok",
     "self-test interrupts: ok",
     "self-test timer: ok",
     "breakpoint (int3) at",
@@ -55,7 +56,12 @@ const CASES: &[Case] = &[
         command_line: "",
         qemu_args: &[],
         expected: &["boot finished, idling"],
-        anywhere: &[],
+        anywhere: &[
+            "smp: 4 CPUs",
+            "cpu 1 online",
+            "cpu 2 online",
+            "cpu 3 online",
+        ],
     },
     Case {
         name: "pagefault",
@@ -136,6 +142,18 @@ const CASES: &[Case] = &[
         ],
         anywhere: &[],
     },
+    // An AP takes a double fault: it must land on that AP's own interrupt stack.
+    Case {
+        name: "apdoublefault",
+        command_line: "test=apdoublefault",
+        qemu_args: &[],
+        expected: &[
+            "CPU EXCEPTION: Double fault (#DF, vector 8)",
+            "on cpu 1",
+            "system halted",
+        ],
+        anywhere: &[],
+    },
     // A task overflows its stack into the guard page.
     Case {
         name: "taskstack",
@@ -146,6 +164,14 @@ const CASES: &[Case] = &[
             "system halted",
         ],
         anywhere: &[],
+    },
+    // A machine with a single core still boots (a later `-smp` replaces the default one).
+    Case {
+        name: "onecpu",
+        command_line: "",
+        qemu_args: &["-smp", "1"],
+        expected: &["boot finished, idling"],
+        anywhere: &["smp: 1 CPUs, 0 started besides the boot CPU"],
     },
     // The same boot on a CPU without x2APIC, so the xAPIC (memory-mapped) path is tested too.
     Case {
@@ -170,7 +196,8 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
 const DRAIN_TIME: Duration = Duration::from_millis(500);
 
 pub fn run() -> Result<()> {
-    let kernel = build_kernel(&["selftest"])?;
+    // Self-tests exist only in debug builds (the feature refuses release).
+    let kernel = build_kernel(&["selftest"], Profile::Debug)?;
     let bootloader = limine::build(&build_dir()?)?;
     let image = build_dir()?.join("test.img");
 

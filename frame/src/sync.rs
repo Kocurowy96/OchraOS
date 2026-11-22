@@ -36,6 +36,25 @@ impl<T> IrqMutex<T> {
     }
 }
 
+impl<T> IrqMutex<T> {
+    /// Takes the lock if it is free right now; otherwise returns `None` at once.
+    pub fn try_lock(&self) -> Option<IrqMutexGuard<'_, T>> {
+        let were_enabled = interrupts::disable();
+        match self.inner.try_lock() {
+            Some(guard) => Some(IrqMutexGuard {
+                guard: ManuallyDrop::new(guard),
+                were_enabled,
+            }),
+            None => {
+                if were_enabled {
+                    interrupts::enable();
+                }
+                None
+            }
+        }
+    }
+}
+
 /// Access to the data of a locked [`IrqMutex`]; unlocking happens on drop.
 pub struct IrqMutexGuard<'a, T> {
     guard: ManuallyDrop<spin::MutexGuard<'a, T>>,

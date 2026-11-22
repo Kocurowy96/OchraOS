@@ -4,6 +4,11 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | SMP: APs are started by Limine (MP request), not by an own INIT-SIPI-SIPI trampoline; CPUs get logical indexes (boot CPU 0) | no 16/32-bit start-up code and far less `unsafe`; Limine leaves every AP in 64-bit mode |
+| 2026-11-22 | Per-CPU data through the GS base (`gs:[0]` holds the structure's own address), allocated on the heap per CPU (no `MAX_CPUS`); read only with interrupts off | one instruction to find it; the same mechanism `swapgs` needs for syscalls in stage 2 |
+| 2026-11-22 | Every CPU has its own GDT and TSS (a loaded TSS is busy and cannot be shared) and its own double fault stack with a guard page; the IDT is shared | the TSS holds per-CPU interrupt stacks; the IDT never changes |
+| 2026-11-22 | The crash-report writer takes the COM1 lock if it comes free within a bounded spin, and keeps it | the report is not mixed with other CPUs' lines; a lock held by the crashed code itself does not block it |
+| 2026-11-22 | QEMU runs with `-smp 4` for `run` and `test`; one test boot uses `-smp 1` | SMP code is always exercised; single-CPU machines keep working |
 | 2026-11-22 | Scheduling split: the mechanism (task stacks with guard pages, context switch, current task) in `ochra_frame::task`, the policy (round-robin run queue, switch on every timer tick) in the safe `kernel` crate | the policy can change without new `unsafe`; the context switch saves only callee-saved registers, the interrupt path saves the rest |
 | 2026-11-22 | End-of-interrupt is sent before the interrupt handler runs (interrupts stay off until `iretq`) | a handler may switch tasks and not return for a while; the APIC must not wait for it |
 | 2026-11-22 | After boot the kernel only runs tasks: an `idle` task (`sti; hlt` loop) replaces halting; tasks do not exit yet | the boot stack (no guard page) is left for good; task exit comes with processes in stage 2 |

@@ -25,8 +25,8 @@ Do not start work that belongs to a later stage unless the owner asks for it.
 ## Working mode (from stage 1)
 
 Work through the steps of a stage without stopping after each; the owner reads the code as
-it lands. Stage 1 pitstops: P1 after steps 1–2, P2 after 3–5, P3 after 6–7, P4 after 8–9
-(end of the stage, tag `stage-1`).
+it lands. Stage 1 pitstops were P1 after steps 1–2, P2 after 3–5, P3 after 6–7, P4 after 8–9 (tag
+`stage-1`). Stage 1.5: P1 after steps 1–3, P2 after 4–5, P3 after 6–7 (tag `stage-1.5`).
 
 At a pitstop: `cargo fmt`, `cargo clippy` and `cargo xtask test` green; a short report (what
 was done, what differs from the plan, open questions); a journal entry; everything staged;
@@ -53,8 +53,8 @@ journal/    session journal, one file per day (journal/YYYY-MM-DD.md)
 Created during stage 0; keep this list up to date:
 
 ```
-cargo xtask build    # build the kernel and the bootable image
-cargo xtask run      # boot in QEMU (UEFI via OVMF), serial output in the terminal
+cargo xtask build    # build the kernel and the bootable image (--release: optimised)
+cargo xtask run      # boot in QEMU (UEFI via OVMF), 4 cores, serial in the terminal
 cargo xtask test     # boot in QEMU headless and check the serial log
 cargo xtask check-unsafe  # fail if `unsafe` appears in code outside frame/
 ```

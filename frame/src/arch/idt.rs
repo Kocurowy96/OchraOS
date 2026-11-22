@@ -85,7 +85,15 @@ pub fn init() {
         }
         idt
     });
+    load_table(idt);
+}
 
+/// Loads the IDT filled in by [`init`] into this CPU (an AP).
+pub(crate) fn load() {
+    load_table(IDT.get().expect("idt::init has run on the boot CPU"));
+}
+
+fn load_table(idt: &'static Idt) {
     let pointer = DescriptorTablePointer {
         limit: (size_of::<Idt>() - 1) as u16,
         base: idt.as_ptr() as u64,

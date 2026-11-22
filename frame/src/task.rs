@@ -22,6 +22,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::interrupts;
+use crate::cpu_local;
 use crate::mm::paging::KernelStack;
 use crate::sync::IrqMutex;
 
@@ -55,8 +56,6 @@ impl Task {
     }
 }
 
-/// The task running on this CPU (one CPU for now; per-CPU with SMP in stage 1.5).
-static CURRENT: IrqMutex<Option<Arc<Task>>> = IrqMutex::new(None);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Creates a task that will run `entry` (with interrupts on) the first time it is switched
@@ -90,7 +89,12 @@ pub fn spawn(name: &'static str, entry: fn() -> !) -> Arc<Task> {
 
 /// The running task, or `None` before [`start`].
 pub fn current() -> Option<Arc<Task>> {
-    CURRENT.lock().clone()
+    let were_enabled = interrupts::disable();
+    let task = current_slot().lock().clone();
+    if were_enabled {
+        interrupts::enable();
+    }
+    task
 }
 
 /// Leaves the boot stack for good and runs `first`. Call once, from the boot code.
@@ -98,7 +102,7 @@ pub fn start(first: Arc<Task>) -> ! {
     interrupts::disable();
     // SAFETY: reading the new task's saved stack pointer; it is not running anywhere yet.
     let next_rsp = unsafe { *first.saved_rsp.get() };
-    *CURRENT.lock() = Some(first);
+    *current_slot().lock() = Some(first);
     // The boot stack's context is saved into a throw-away variable: nothing ever switches back.
     let mut boot_rsp = 0;
     // SAFETY: `next_rsp` was prepared by `spawn`; the boot stack is abandoned, so whatever
@@ -111,7 +115,7 @@ pub fn start(first: Arc<Task>) -> ! {
 /// back to. Must not be called while holding a lock that `next` might need.
 pub fn switch_to(next: Arc<Task>) {
     let were_enabled = interrupts::disable();
-    let previous = CURRENT
+    let previous = current_slot()
         .lock()
         .replace(next.clone())
         .expect("task::start has run");
@@ -125,7 +129,7 @@ pub fn switch_to(next: Arc<Task>) {
     // SAFETY: `next` is not running (it is not the current task, and there is one CPU), so
     // its saved stack pointer is stable.
     let next_rsp = unsafe { *next.saved_rsp.get() };
-    // `CURRENT` keeps `next` alive; `previous` stays alive in this stack frame while
+    // The per-CPU current task keeps `next` alive; `previous` stays alive in this stack frame while
     // suspended, and the scheduler's queue holds it too.
     drop(next);
     // SAFETY: `previous_rsp` points into the current task's `Task`, alive (see above);
@@ -136,6 +140,13 @@ pub fn switch_to(next: Arc<Task>) {
     if were_enabled {
         interrupts::enable();
     }
+}
+
+/// This CPU's "current task" slot. Interrupts must be off (see `cpu_local`).
+fn current_slot() -> &'static IrqMutex<Option<Arc<Task>>> {
+    &cpu_local::this()
+        .expect("per-CPU data is set up before tasks run")
+        .current_task
 }
 
 /// Saves the callee-saved registers and the stack pointer into `*previous_rsp`, then loads
