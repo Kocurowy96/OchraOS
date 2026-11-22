@@ -4,6 +4,8 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | Every CPU runs its own local APIC (mode chosen once on the boot CPU, mode bit set per core) and its own periodic timer; the timer is calibrated once against the PIT, on the boot CPU, before the APs start | one PIT to measure with; all cores share the timer clock |
+| 2026-11-22 | A panic or fatal exception stops the other CPUs with an NMI ("all excluding self"); they confirm, and the report says how many stopped; a second crashing CPU halts quietly | an NMI also reaches CPUs spinning with interrupts off; nothing runs on after a crash |
 | 2026-11-22 | SMP: APs are started by Limine (MP request), not by an own INIT-SIPI-SIPI trampoline; CPUs get logical indexes (boot CPU 0) | no 16/32-bit start-up code and far less `unsafe`; Limine leaves every AP in 64-bit mode |
 | 2026-11-22 | Per-CPU data through the GS base (`gs:[0]` holds the structure's own address), allocated on the heap per CPU (no `MAX_CPUS`); read only with interrupts off | one instruction to find it; the same mechanism `swapgs` needs for syscalls in stage 2 |
 | 2026-11-22 | Every CPU has its own GDT and TSS (a loaded TSS is busy and cannot be shared) and its own double fault stack with a guard page; the IDT is shared | the TSS holds per-CPU interrupt stacks; the IDT never changes |

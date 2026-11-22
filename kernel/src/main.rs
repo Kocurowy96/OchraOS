@@ -66,11 +66,7 @@ fn main(boot: &'static BootInfo) -> ! {
 
     selftest::prepare(command_line);
     smp::init_boot_cpu();
-    let others = smp::start_other_cpus(ap_main);
-    info!(
-        "smp: {} CPUs, {others} started besides the boot CPU",
-        smp::cpu_count()
-    );
+    time::init(smp::cpu_count());
 
     let local_apic = apic::init();
     pic::disable();
@@ -85,6 +81,13 @@ fn main(boot: &'static BootInfo) -> ! {
         timer.hz, timer.counts_per_ms
     );
     interrupts::enable();
+
+    // The other CPUs set up their own local APIC and timer, which needs the boot CPU's done.
+    let others = smp::start_other_cpus(ap_main);
+    info!(
+        "smp: {} CPUs, {others} started besides the boot CPU",
+        smp::cpu_count()
+    );
 
     selftest::run_checks();
     exceptions::breakpoint_self_test();
@@ -104,15 +107,20 @@ fn main(boot: &'static BootInfo) -> ! {
     sched::start();
 }
 
-/// Where the other CPUs (APs) arrive once their CPU state is set up. For now they stop here;
-/// they join the scheduler later in stage 1.5.
+/// Where the other CPUs (APs) arrive once their CPU state is set up. For now they only take
+/// timer interrupts; they join the scheduler later in stage 1.5.
 fn ap_main(cpu: CpuInfo) -> ! {
+    let local_apic = apic::init();
+    apic::start_timer(time::HZ);
     info!(
-        "cpu {} online (APIC id {}), CPU protections: {}",
-        cpu.index, cpu.apic_id, cpu.protections
+        "cpu {} online (APIC id {}, {}), CPU protections: {}",
+        cpu.index, cpu.apic_id, local_apic.kind, cpu.protections
     );
+    interrupts::enable();
     selftest::on_ap(cpu.index);
-    arch::halt_forever();
+    loop {
+        interrupts::wait();
+    }
 }
 
 /// Runs when no other task has work: sleeps until the next interrupt.

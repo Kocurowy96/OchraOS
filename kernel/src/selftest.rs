@@ -259,18 +259,23 @@ fn check_interrupts() {
 /// (emulation in CI is not stable in time).
 #[cfg(feature = "selftest")]
 fn check_timer() {
+    use crate::time;
     use ochra_frame::arch::interrupts;
 
-    let start = crate::time::ticks();
+    let cpus = ochra_frame::smp::cpu_count();
+    let start: alloc::vec::Vec<u64> = (0..cpus).map(time::ticks_on).collect();
+    let all_ticked = || (0..cpus).all(|cpu| time::ticks_on(cpu) >= start[cpu as usize] + 5);
     for _ in 0..1000 {
-        if crate::time::ticks() >= start + 5 {
+        if all_ticked() {
             break;
         }
         interrupts::wait();
     }
-    let seen = crate::time::ticks() - start;
-    assert!(seen >= 5, "self-test timer: only {seen} ticks");
-    log::info!("self-test timer: ok ({seen} ticks)");
+    for cpu in 0..cpus {
+        let seen = time::ticks_on(cpu) - start[cpu as usize];
+        assert!(seen >= 5, "self-test timer: only {seen} ticks on cpu {cpu}");
+    }
+    log::info!("self-test timer: ok (every one of {cpus} CPUs got at least 5 ticks)");
 }
 
 /// Steps each scheduler test task takes.
@@ -389,13 +394,14 @@ pub fn prepare(command_line: &str) {
 #[cfg(not(feature = "selftest"))]
 pub fn prepare(_command_line: &str) {}
 
-/// Called by every AP when it reaches the kernel.
+/// Called by every AP when it reaches the kernel, with interrupts on.
 pub fn on_ap(index: u32) {
     cpu_arrived(index);
     #[cfg(feature = "selftest")]
     if index == 1 && AP_DOUBLE_FAULT.load(core::sync::atomic::Ordering::Relaxed) {
+        // Waiting with interrupts on, so this CPU's timer keeps ticking for `check_timer`.
         while !AP_DOUBLE_FAULT_GO.load(core::sync::atomic::Ordering::Acquire) {
-            core::hint::spin_loop();
+            ochra_frame::arch::interrupts::wait();
         }
         ochra_frame::selftest::double_fault();
     }

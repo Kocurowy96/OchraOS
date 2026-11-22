@@ -19,5 +19,6 @@ fn panic(info: &PanicInfo) -> ! {
         serial,
         "\n{RED}{BOLD}KERNEL PANIC{RESET}{RED}: {info}{RESET}"
     );
+    crate::arch::exceptions::write_stopped(&mut serial);
     halt_forever();
 }

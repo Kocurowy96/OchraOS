@@ -219,6 +219,7 @@ pub(super) extern "C" fn common_entry() {
     )
 }
 
+const NMI: u64 = 2;
 const BREAKPOINT: u64 = 3;
 const DOUBLE_FAULT: u64 = 8;
 const PAGE_FAULT: u64 = 14;
@@ -227,6 +228,10 @@ extern "C" fn handle_exception(frame: &ExceptionFrame) {
     if frame.vector >= u64::from(interrupts::FIRST_VECTOR) {
         interrupts::dispatch(frame);
         return;
+    }
+    if frame.vector == NMI && crate::smp::stop_requested() {
+        // Another CPU crashed and stops everyone; it prints the report.
+        halt_forever();
     }
     if frame.vector == BREAKPOINT {
         // `int3` is only ever placed on purpose, never inside the logger, so taking the
@@ -242,6 +247,25 @@ extern "C" fn handle_exception(frame: &ExceptionFrame) {
     halt_forever();
 }
 
+/// Stops the other CPUs and says so in the report. Shared with the panic handler.
+pub(crate) fn write_stopped(out: &mut impl Write) {
+    match crate::smp::stop_other_cpus() {
+        // Another CPU is stopping everyone and reporting its own crash; stop quietly.
+        None => halt_forever(),
+        Some(result) if result.others == 0 => {}
+        Some(result) if result.stopped == result.others => {
+            let _ = writeln!(out, "  stopped {} other CPUs", result.others);
+        }
+        Some(result) => {
+            let _ = writeln!(
+                out,
+                "  stopped {} of {} other CPUs",
+                result.stopped, result.others
+            );
+        }
+    }
+}
+
 /// Prints a readable description of a fatal exception.
 fn report(frame: &ExceptionFrame) {
     // Not `println!`: the exception may have hit while the COM1 lock was held.
@@ -254,6 +278,7 @@ fn report(frame: &ExceptionFrame) {
         frame.vector
     );
     let _ = writeln!(out, "  on cpu {}", crate::cpu_local::cpu_index());
+    write_stopped(&mut out);
 
     match frame.vector {
         PAGE_FAULT => {

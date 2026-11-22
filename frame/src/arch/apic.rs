@@ -88,25 +88,24 @@ pub struct Info {
     pub id: u32,
 }
 
-/// Enables this core's local APIC. Call once, after paging is set up (xAPIC needs a mapping).
+/// Enables this core's local APIC. Call once on every CPU, the boot CPU first, after paging
+/// is set up (xAPIC needs a mapping). The mode is chosen once, on the boot CPU; the mode bit
+/// itself is per core, so every CPU sets it.
 pub fn init() -> Info {
     let features = __cpuid(1);
     assert!(features.edx & (1 << 9) != 0, "this CPU has no local APIC");
     let has_x2apic = features.ecx & (1 << 21) != 0;
 
     let base = read_msr(IA32_APIC_BASE);
+    // Every core's xAPIC registers appear at the same physical address (each core sees its
+    // own APIC there), so one mapping serves all of them.
     let apic = APIC.call_once(|| {
         if has_x2apic {
-            // SAFETY: CPUID reports x2APIC support; switching the enabled APIC to x2APIC mode
-            // only changes how its registers are reached (MSRs instead of memory).
-            unsafe { write_msr(IA32_APIC_BASE, base | BASE_ENABLE | BASE_X2APIC) };
             LocalApic {
                 kind: Kind::X2Apic,
                 registers: 0,
             }
         } else {
-            // SAFETY: setting the global enable bit keeps the default base address.
-            unsafe { write_msr(IA32_APIC_BASE, base | BASE_ENABLE) };
             let physical = PhysAddr(base & 0x000F_FFFF_FFFF_F000);
             LocalApic {
                 kind: Kind::XApic,
@@ -114,6 +113,14 @@ pub fn init() -> Info {
             }
         }
     });
+    match apic.kind {
+        // SAFETY: CPUID reports x2APIC support (checked on the boot CPU; all cores of a
+        // machine are the same model); switching the enabled APIC to x2APIC mode only changes
+        // how its registers are reached (MSRs instead of memory).
+        Kind::X2Apic => unsafe { write_msr(IA32_APIC_BASE, base | BASE_ENABLE | BASE_X2APIC) },
+        // SAFETY: setting the global enable bit keeps the default base address.
+        Kind::XApic => unsafe { write_msr(IA32_APIC_BASE, base | BASE_ENABLE) },
+    }
 
     // Accept interrupts of every priority, and enable the APIC with our spurious vector.
     apic.write(TASK_PRIORITY, 0);
@@ -163,22 +170,45 @@ pub struct TimerInfo {
     pub hz: u32,
 }
 
-/// Calibrates the local APIC timer against the PIT, then starts it in periodic mode: it
-/// raises [`TIMER_VECTOR`] `hz` times per second. Register a handler for that vector first.
+/// Timer counts per millisecond, measured once on the boot CPU. All cores share the same
+/// timer clock, and there is only one PIT to measure with.
+static COUNTS_PER_MS: Once<u32> = Once::new();
+
+/// Starts this core's local APIC timer in periodic mode: it raises [`TIMER_VECTOR`] `hz` times
+/// per second. The first call (on the boot CPU) calibrates it against the PIT. Register a
+/// handler for the vector first.
 pub fn start_timer(hz: u32) -> TimerInfo {
     let apic = local();
     apic.write(TIMER_DIVIDE, DIVIDE_BY_16);
-    let counted = pit::measure(
-        10,
-        || apic.write(TIMER_INITIAL_COUNT, u32::MAX),
-        || u32::MAX - apic.read(TIMER_CURRENT_COUNT),
-    );
-    apic.write(TIMER_INITIAL_COUNT, 0);
-    let counts_per_ms = (counted / 10).max(1);
+    let counts_per_ms = *COUNTS_PER_MS.call_once(|| {
+        let counted = pit::measure(
+            10,
+            || apic.write(TIMER_INITIAL_COUNT, u32::MAX),
+            || u32::MAX - apic.read(TIMER_CURRENT_COUNT),
+        );
+        apic.write(TIMER_INITIAL_COUNT, 0);
+        (counted / 10).max(1)
+    });
 
     apic.write(LVT_TIMER, TIMER_PERIODIC | u32::from(TIMER_VECTOR));
     apic.write(TIMER_INITIAL_COUNT, (counts_per_ms * 1000 / hz).max(1));
     TimerInfo { counts_per_ms, hz }
+}
+
+/// Sends a non-maskable interrupt to every other core. Returns `false` if the local APIC is
+/// not set up yet (then nothing is sent).
+pub(crate) fn send_nmi_to_others() -> bool {
+    let Some(apic) = APIC.get() else {
+        return false;
+    };
+    // Destination shorthand 11 = "all excluding self", delivery mode 100 = NMI.
+    apic.write(INTERRUPT_COMMAND, (0b11 << 18) | (0b100 << 8));
+    if apic.kind == Kind::XApic {
+        while apic.read(INTERRUPT_COMMAND) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+    true
 }
 
 fn local() -> &'static LocalApic {

@@ -69,6 +69,7 @@ const CASES: &[Case] = &[
         qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Page fault (#PF, vector 14)",
+            "stopped 3 other CPUs",
             "write to a non-present page, in kernel mode",
             "address  0x00000000deadbeef",
             "system halted",
@@ -81,6 +82,7 @@ const CASES: &[Case] = &[
         qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Double fault (#DF, vector 8)",
+            "stopped 3 other CPUs",
             "system halted",
         ],
         anywhere: &[],
@@ -150,6 +152,7 @@ const CASES: &[Case] = &[
         expected: &[
             "CPU EXCEPTION: Double fault (#DF, vector 8)",
             "on cpu 1",
+            "stopped 3 other CPUs",
             "system halted",
         ],
         anywhere: &[],
@@ -161,6 +164,7 @@ const CASES: &[Case] = &[
         qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Double fault (#DF, vector 8)",
+            "stopped 3 other CPUs",
             "system halted",
         ],
         anywhere: &[],

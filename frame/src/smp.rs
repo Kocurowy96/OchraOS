@@ -13,12 +13,12 @@
 //!
 //! CPUs get a logical index: the BSP is 0, the APs 1, 2, … in the order Limine lists them.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use limine::mp::Cpu;
 use spin::Once;
 
-use crate::arch::{self, cpu::Protections};
+use crate::arch::{self, apic, cpu::Protections};
 use crate::mm::paging;
 use crate::{boot, cpu_local};
 
@@ -73,6 +73,49 @@ pub fn start_other_cpus(main: fn(CpuInfo) -> !) -> u32 {
         core::hint::spin_loop();
     }
     started
+}
+
+/// Set once a CPU has started stopping all the others (see [`stop_other_cpus`]).
+static STOPPING: AtomicBool = AtomicBool::new(false);
+/// CPUs that received the stop NMI and halted.
+static STOPPED: AtomicU32 = AtomicU32::new(0);
+
+/// How the other CPUs were stopped, for the crash report.
+pub(crate) struct Stopped {
+    pub(crate) stopped: u32,
+    pub(crate) others: u32,
+}
+
+/// Stops every other CPU with a non-maskable interrupt (it arrives even while a CPU has
+/// interrupts off, e.g. spinning on a lock), so nothing runs on after a crash. Waits a
+/// bounded time for them to confirm. Returns `None` if another CPU is already stopping
+/// everyone: then this one is about to be stopped too.
+pub(crate) fn stop_other_cpus() -> Option<Stopped> {
+    if STOPPING.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let others = ONLINE.load(Ordering::Acquire);
+    if others > 0 && apic::send_nmi_to_others() {
+        let mut spins: u32 = 0;
+        while STOPPED.load(Ordering::Acquire) < others && spins < 100_000_000 {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+    }
+    Some(Stopped {
+        stopped: STOPPED.load(Ordering::Acquire),
+        others,
+    })
+}
+
+/// Called for every NMI: `true` if it was the stop signal (the caller then halts).
+pub(crate) fn stop_requested() -> bool {
+    if STOPPING.load(Ordering::Acquire) {
+        STOPPED.fetch_add(1, Ordering::Release);
+        true
+    } else {
+        false
+    }
 }
 
 /// Where every AP starts.
