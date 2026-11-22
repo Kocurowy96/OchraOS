@@ -56,12 +56,14 @@ jobs:
           key: limine-${{ runner.os }}-${{ hashFiles('xtask/src/limine.rs') }}
       - run: cargo xtask build
       - run: cargo xtask test
-      - name: Upload the serial logs
+      - name: Upload the logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: serial-logs
-          path: build/test-*.log
+          name: logs
+          path: |
+            build/test-*.log
+            build/limine/build.log
           if-no-files-found: ignore
 
   dco:

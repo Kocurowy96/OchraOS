@@ -4,6 +4,7 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | DCO check in CI has no exception for bots: Dependabot commits are amended with `git commit --amend -s` by the owner before merging | only a human can certify the DCO; one strict rule is easier to trust than a list of exceptions |
 | 2026-11-22 | With KASLR, kernel addresses (physical/virtual base, direct map, pointers) appear in the log only in debug/Nightly builds, or are shown only to root (like Linux `kptr_restrict` / `dmesg_restrict`) | a logged address reveals the random offset and defeats KASLR; stage 0 logs them freely until then |
 | 2026-11-22 | Kernel linked as a static executable — **temporary**; back to PIE for KASLR (Limine relocates the kernel) at the latest in stage 1, together with paging | simplest start for stage 0; KASLR from `docs/security.md` needs a relocatable kernel |
 | 2026-11-22 | Limine built from its pinned source release (SHA-256 checked) by `cargo xtask` | no binaries in the repository; the source tarball is reproducible and verifiable |

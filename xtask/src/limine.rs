@@ -42,8 +42,10 @@ pub fn build(build_dir: &Path) -> Result<PathBuf> {
 
     step(&format!("building Limine {VERSION} (only the first time)"));
     std::fs::create_dir_all(&out)?;
-    // Only the x86-64 UEFI port. Limine defaults to clang + ld.lld; we use the host GCC and
-    // GNU ld, which every Linux distribution (and the CI image) has anyway.
+    // Only the x86-64 UEFI port. Limine defaults to the LLVM tools (clang, ld.lld,
+    // llvm-objcopy…); we use the host GCC and binutils instead, which every Linux distribution
+    // (and the CI image) has anyway. All five tools must be named: the ones left out keep
+    // their `llvm-` default.
     // The compiler output is long and uninteresting; it goes to a log file instead.
     let log = dir.join("build.log");
     run_logged(
@@ -53,6 +55,9 @@ pub fn build(build_dir: &Path) -> Result<PathBuf> {
                 "--enable-uefi-x86-64",
                 "CC_FOR_TARGET=gcc",
                 "LD_FOR_TARGET=ld",
+                "OBJCOPY_FOR_TARGET=objcopy",
+                "OBJDUMP_FOR_TARGET=objdump",
+                "READELF_FOR_TARGET=readelf",
             ]),
         &log,
     )?;

@@ -108,8 +108,17 @@ fn run(command: &mut Command) -> Result<()> {
 }
 
 /// Like [`run`], but appends the command's output to `log` instead of printing it.
+/// On failure the end of the log is printed, so the cause shows up in CI output too.
 fn run_logged(command: &mut Command, log: &Path) -> Result<()> {
     let file = OpenOptions::new().create(true).append(true).open(log)?;
     command.stdout(file.try_clone()?).stderr(file);
-    run(command).map_err(|error| format!("{error}; see {}", log.display()).into())
+    run(command).map_err(|error| {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        eprintln!("--- last lines of {} ---", log.display());
+        for line in &lines[lines.len().saturating_sub(20)..] {
+            eprintln!("{line}");
+        }
+        format!("{error}; full output in {}", log.display()).into()
+    })
 }
