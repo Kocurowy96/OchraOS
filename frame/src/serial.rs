@@ -87,6 +87,14 @@ impl SerialPort {
         self.write_reg(DATA, byte);
     }
 
+    /// A byte that has arrived, if any (never waits). Without interrupts from the UART the
+    /// kernel polls this (decisions.md); its receive buffer holds 16 bytes.
+    pub fn receive(&mut self) -> Option<u8> {
+        /// Line status bit 0: a received byte is waiting in the data register.
+        const DATA_READY: u8 = 1;
+        (self.read_reg(LINE_STATUS) & DATA_READY != 0).then(|| self.read_reg(DATA))
+    }
+
     fn write_reg(&mut self, offset: u16, value: u8) {
         // SAFETY: `new` guarantees that we own the UART at `base`, and every offset used in
         // this file is one of its registers.

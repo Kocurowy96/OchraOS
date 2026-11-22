@@ -64,6 +64,16 @@ int main(void) {
     report("mmap MAP_FIXED below 64 KiB", (long)mmap((void *)PAGE, PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0));
     report("mmap of a file (bad fd)", (long)mmap(NULL, PAGE, PROT_READ, MAP_PRIVATE, 99, 0));
 
+    // Stack Clash protection: a hint just below the stack lies in the guard gap below it
+    // (Linux's stack_guard_gap, 1 MiB), so mmap must put the mapping somewhere else.
+    uintptr_t stack = (uintptr_t)__builtin_frame_address(0) & ~(uintptr_t)(PAGE - 1);
+    void *below_stack = (void *)(stack - 256 * 1024);
+    void *placed = mmap(below_stack, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check("hint in the stack guard gap not used", placed != below_stack);
+    check("mapping not within 1 MiB under the stack",
+          (uintptr_t)placed + PAGE <= stack - 1024 * 1024 - 256 * 1024 || (uintptr_t)placed > stack);
+    munmap(placed, PAGE);
+
     char *small = malloc(100);
     char *large = malloc(1 << 20);
     check("malloc", small != NULL && large != NULL);

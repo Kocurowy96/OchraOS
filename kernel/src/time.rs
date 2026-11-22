@@ -34,6 +34,10 @@ pub fn on_tick(_vector: u8) {
     if let Some(count) = TICKS.lock().get_mut(cpu_index() as usize) {
         *count += 1;
     }
+    // Keyboard input on the serial console, polled by one CPU (decisions.md).
+    if cpu_index() == 0 {
+        crate::console::poll();
+    }
     // The time slice of the running task is over.
     crate::sched::schedule();
 }

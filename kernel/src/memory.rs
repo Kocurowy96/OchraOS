@@ -24,6 +24,11 @@ pub const MIN_ADDRESS: u64 = 0x1_0000;
 /// How far the stack may grow: Linux's default `RLIMIT_STACK` (8 MiB).
 pub const STACK_LIMIT: u64 = 8 * 1024 * 1024;
 
+/// Free space kept below the stack's room to grow, where `mmap` puts nothing: Linux's
+/// `stack_guard_gap` (256 pages). Without it, a mapping could sit right under the stack, and
+/// a large stack frame could jump over the last stack page straight into it ("Stack Clash").
+pub const STACK_GUARD_GAP: u64 = 256 * FRAME_SIZE;
+
 pub fn page_down(address: u64) -> u64 {
     address & !(FRAME_SIZE - 1)
 }
@@ -72,7 +77,7 @@ fn access(protection: u64) -> Result<UserAccess, Errno> {
 }
 
 /// The address ranges in use, as `start -> end` (page-aligned, never overlapping).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Areas(BTreeMap<u64, u64>);
 
 impl Areas {
@@ -134,6 +139,8 @@ impl Areas {
     }
 }
 
+/// `Clone` for `fork`: the child gets the same layout (its pages are copied separately).
+#[derive(Clone)]
 pub struct Memory {
     areas: Areas,
     /// The program break: `brk_start..brk` is the heap that `brk` grows and shrinks; its
@@ -177,14 +184,15 @@ impl Memory {
     }
 
     /// Sets up the stack: `bottom..top` is mapped now, and it may grow down to `top -
-    /// STACK_LIMIT` when used.
+    /// STACK_LIMIT` when used. Below that, the guard gap is reserved too.
     pub fn map_stack(&mut self, space: &UserSpace, bottom: u64, top: u64) -> Result<(), Errno> {
         let limit = top - STACK_LIMIT;
-        if !self.areas.is_free(limit, top) {
+        let reserved = limit - STACK_GUARD_GAP;
+        if !self.areas.is_free(reserved, top) {
             return Err(ENOMEM);
         }
         populate(space, bottom, top, UserAccess::READ_WRITE)?;
-        self.areas.insert(limit, top);
+        self.areas.insert(reserved, top);
         self.stack_limit = limit;
         self.stack_bottom = bottom;
         Ok(())
@@ -294,7 +302,7 @@ impl Memory {
             let hint_fits = hint >= MIN_ADDRESS
                 && hint
                     .checked_add(length)
-                    .is_some_and(|end| end <= self.mmap_base && self.areas.is_free(hint, end));
+                    .is_some_and(|end| end <= USER_END && self.areas.is_free(hint, end));
             if hint_fits {
                 hint
             } else {

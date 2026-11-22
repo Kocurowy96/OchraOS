@@ -73,6 +73,21 @@ impl UserContext {
         self.0.rsp = address;
     }
 
+    /// Starts a new program in this context (`execve`): every general register zero, except
+    /// the instruction and stack pointers; flags as at the first entry to user mode.
+    pub fn start_program(&mut self, entry: u64, stack: u64) {
+        let fresh = fresh_frame(entry, stack);
+        self.0 = ExceptionFrame {
+            vector: self.0.vector,
+            error_code: self.0.error_code,
+            ..fresh
+        };
+    }
+
+    pub(crate) fn frame(&self) -> &ExceptionFrame {
+        &self.0
+    }
+
     /// # Safety
     ///
     /// `frame` must describe user mode.
@@ -166,7 +181,11 @@ fn report_fault(frame: &mut ExceptionFrame, fault: UserFault) {
 /// Starts executing user code at `entry` with the stack pointer `stack`, in the current
 /// task's address space. Never returns: the task continues in user mode.
 pub fn enter(entry: u64, stack: u64) -> ! {
-    interrupts::disable();
+    resume(fresh_frame(entry, stack))
+}
+
+/// The registers of a program about to start at `entry` with the stack pointer `stack`.
+fn fresh_frame(entry: u64, stack: u64) -> ExceptionFrame {
     let mut frame = ExceptionFrame::zeroed();
     frame.rip = entry;
     frame.cs = u64::from(USER_CODE);
@@ -174,6 +193,13 @@ pub fn enter(entry: u64, stack: u64) -> ! {
     frame.rflags = 1 << 9 | 1 << 1;
     frame.rsp = stack;
     frame.ss = u64::from(USER_DATA);
+    frame
+}
+
+/// Continues in user mode with the registers `frame` (a copy made for `fork`). Never
+/// returns.
+pub(crate) fn resume(mut frame: ExceptionFrame) -> ! {
+    interrupts::disable();
     // Check the address now, as `handle` does for every return to user mode.
     while frame.rip >= USER_END {
         let fault = UserFault {

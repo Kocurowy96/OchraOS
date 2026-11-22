@@ -40,6 +40,8 @@ pub(crate) struct PerCpu {
     apic_id: u32,
     /// The task running on this CPU (`None` before the scheduler starts here).
     pub(crate) current_task: IrqMutex<Option<Arc<Task>>>,
+    /// A task that has just exited on this CPU, freed by the next one (see `task`).
+    pub(crate) reaped_task: IrqMutex<Option<Arc<Task>>>,
     /// The last TLB shootdown request this CPU answered (see `mm::tlb`).
     pub(crate) tlb_sequence: AtomicU64,
 }
@@ -55,6 +57,7 @@ pub(crate) fn init(index: u32, apic_id: u32, tables: &'static CpuTables) {
         index,
         apic_id,
         current_task: IrqMutex::new(None),
+        reaped_task: IrqMutex::new(None),
         tlb_sequence: AtomicU64::new(0),
     }));
     data.this = &raw const *data;

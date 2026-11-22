@@ -70,7 +70,7 @@ Checklist:
 - [x] P2: initramfs (cpio, Limine module), ELF loader with auxv, `brk`/`mmap`/`munmap`/
       `mprotect`, TLS, ChaCha20 CSPRNG in `frame` (seeded from RDRAND, RDSEED and the TSC,
       with CPUID and sanity checks) for `AT_RANDOM`, ASLR and `getrandom`; musl "hello"
-- [ ] P3: wait queues, blocking and wake-up from another CPU, task exit; processes (`fork`,
+- [x] P3: wait queues, blocking and wake-up from another CPU, task exit; processes (`fork`,
       `execve`, `exit`, `wait4`), zombies until `wait4`, orphans to PID 1, panic when init
       dies, address space freed with TLB shootdown; file descriptors, pipes, console;
       test that a new process starts with a clean FPU/SSE state (FCW 0x37F, MXCSR 0x1F80,

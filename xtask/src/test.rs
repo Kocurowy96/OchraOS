@@ -63,7 +63,14 @@ const CASES: &[Case] = &[
         name: "boot",
         command_line: "",
         qemu_args: &[],
-        expected: &["boot finished, idling"],
+        expected: &[
+            "started /init as process 1",
+            "init: running as process 1",
+            "Hello from musl",
+            "init: /bin/hello exited with status 0",
+            "init: waiting for input",
+            "init: got \"ping\"",
+        ],
         anywhere: &[
             "smp: 4 CPUs",
             "cpu 1 online",
@@ -71,9 +78,7 @@ const CASES: &[Case] = &[
             "cpu 3 online",
             "hello from ring 3",
             "user task hello exited with status 0",
-            "started /init as process 1",
-            "Hello from musl",
-            "process 1 (/init) exited with status 0",
+            "boot finished, idling",
         ],
     },
     // The syscall test programs; their results are compared with the host afterwards.
@@ -81,7 +86,24 @@ const CASES: &[Case] = &[
         name: "usertests",
         command_line: "test=usertests",
         qemu_args: &[],
-        expected: &["programs finished", "boot finished, idling"],
+        expected: &[
+            "programs finished",
+            "no frames leaked",
+            "boot finished, idling",
+        ],
+        anywhere: &[],
+    },
+    // Init must never end: the kernel panics, as Linux does. `/bin/hello` exits at once.
+    Case {
+        name: "initexit",
+        command_line: "rdinit=/bin/hello",
+        qemu_args: &[],
+        expected: &[
+            "started /bin/hello as process 1",
+            "Hello from musl",
+            "KERNEL PANIC",
+            "init (process 1) exited with status 0",
+        ],
         anywhere: &[],
     },
     Case {
@@ -229,6 +251,24 @@ const FORBIDDEN: &[&str] = &["KERNEL PANIC", "CPU EXCEPTION", "ERROR"];
 /// After one of these lines the kernel prints nothing more (except, for a panic, the message).
 const FINAL_LINES: &[&str] = &["idling", "system halted", "KERNEL PANIC"];
 
+/// Keys typed on the serial console during a boot (as if on a terminal), once `after`
+/// appears; that boot is complete only when every line in `until` has appeared (or on a
+/// crash), since `/init` keeps running after the kernel reports "idling".
+struct Typing {
+    case: &'static str,
+    after: &'static str,
+    keys: &'static str,
+    until: &'static [&'static str],
+}
+
+const TYPING: &[Typing] = &[Typing {
+    case: "boot",
+    after: "init: waiting for input",
+    // Enter sends a carriage return, as on a real terminal.
+    keys: "ping\r",
+    until: &["init: got", "idling"],
+}];
+
 /// Generous, so the test also passes without KVM (plain emulation on CI runners).
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -250,7 +290,8 @@ pub fn run() -> Result<()> {
     for case in CASES {
         image::create(&image, &kernel, &bootloader, &initramfs, case.command_line)?;
         step(&format!("test {}: booting", case.name));
-        let (log, qemu_errors) = boot(&image, case.qemu_args)?;
+        let typing = TYPING.iter().find(|typing| typing.case == case.name);
+        let (log, qemu_errors) = boot(&image, case.qemu_args, typing)?;
         std::fs::write(build_dir()?.join(format!("test-{}.log", case.name)), &log)?;
         kernel_addresses.extend(kernel_virtual_address(&log));
         match case.name {
@@ -420,11 +461,12 @@ fn keep_failed_log(name: &str, problem: &str, log: &str, qemu_errors: &str) -> R
 
 /// Boots `image` headless and returns the serial output with colour codes removed, and
 /// QEMU's own error output.
-fn boot(image: &Path, extra_args: &[&str]) -> Result<(String, String)> {
+fn boot(image: &Path, extra_args: &[&str], typing: Option<&Typing>) -> Result<(String, String)> {
     let mut qemu = qemu::command(image)?;
     qemu.args(["-display", "none", "-serial", "stdio", "-monitor", "none"])
         .args(extra_args)
-        .stdin(Stdio::null())
+        // QEMU's stdin is the serial port's input.
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = qemu.spawn()?;
@@ -452,17 +494,24 @@ fn boot(image: &Path, extra_args: &[&str]) -> Result<(String, String)> {
         }
     });
 
-    let result = collect(&receiver);
+    let stdin = child.stdin.take().expect("stdin is piped");
+    let result = collect(&receiver, typing, stdin);
     stop(&mut child);
     let qemu_errors = errors.join().unwrap_or_default();
     Ok((result?, qemu_errors))
 }
 
-/// Collects lines until the kernel is done, QEMU exits, or the timeout runs out.
-fn collect(lines: &mpsc::Receiver<String>) -> Result<String> {
+/// Collects lines until the kernel is done, QEMU exits, or the timeout runs out; types the
+/// keys of `typing` on the console when its line appears.
+fn collect(
+    lines: &mpsc::Receiver<String>,
+    typing: Option<&Typing>,
+    mut console: impl std::io::Write,
+) -> Result<String> {
     let mut log = String::new();
     let deadline = Instant::now() + BOOT_TIMEOUT;
     let mut finished = false;
+    let mut typed = false;
     loop {
         let wait = if finished {
             DRAIN_TIME
@@ -471,9 +520,23 @@ fn collect(lines: &mpsc::Receiver<String>) -> Result<String> {
         };
         match lines.recv_timeout(wait) {
             Ok(line) => {
-                finished |= FINAL_LINES.iter().any(|end| line.contains(end));
                 log.push_str(&line);
                 log.push('\n');
+                let crashed = ["system halted", "KERNEL PANIC"]
+                    .iter()
+                    .any(|end| line.contains(end));
+                finished |= match typing {
+                    Some(typing) => crashed || typing.until.iter().all(|until| log.contains(until)),
+                    None => FINAL_LINES.iter().any(|end| line.contains(end)),
+                };
+                if let Some(typing) = typing
+                    && !typed
+                    && line.contains(typing.after)
+                {
+                    console.write_all(typing.keys.as_bytes())?;
+                    console.flush()?;
+                    typed = true;
+                }
             }
             // QEMU exited (e.g. a triple fault with `-no-reboot`): the log is complete.
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(log),

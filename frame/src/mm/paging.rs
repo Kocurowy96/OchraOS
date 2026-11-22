@@ -270,10 +270,9 @@ const STACK_SLOT_SIZE: u64 = 64 * 1024;
 const MAX_STACK_PAGES: u64 = STACK_SLOT_SIZE / FRAME_SIZE - 1;
 static NEXT_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
 
-/// A kernel stack with an unmapped guard page below it.
-///
-/// For now stacks live as long as the kernel (the double fault stack; task stacks come with
-/// the scheduler, together with freeing).
+/// A kernel stack with an unmapped guard page below it. Dropping it unmaps and frees its
+/// pages (on every CPU: kernel pages are shared); its slot of virtual space is not reused
+/// (slot 509 has room for millions of stacks).
 pub struct KernelStack {
     bottom: u64,
     top: u64,
@@ -303,6 +302,32 @@ impl KernelStack {
     /// Lowest mapped address; the page below it is the guard page.
     pub fn bottom(&self) -> u64 {
         self.bottom
+    }
+}
+
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        let pages = (self.top - self.bottom) / FRAME_SIZE;
+        let mut freed = alloc::vec::Vec::with_capacity(pages as usize);
+        {
+            let mut space = kernel_space().lock();
+            for page in 0..pages {
+                let virt = self.bottom + page * FRAME_SIZE;
+                let entry = space.walk(virt, 1, false);
+                // SAFETY: `walk` returns a pointer to an entry inside a live page table
+                // frame; the stack's owner is being dropped, so nothing runs on it.
+                let value = unsafe { entry.read() };
+                // SAFETY: as above.
+                unsafe { entry.write(0) };
+                freed.push(PhysAddr(value & ADDRESS_MASK));
+            }
+        }
+        // Every CPU forgets the old translations before the frames can be reused.
+        super::tlb::flush_kernel(self.bottom, pages);
+        for address in freed {
+            // SAFETY: the frame was owned by this stack's mapping, which is gone everywhere.
+            drop(unsafe { frames::Frame::from_address(address) });
+        }
     }
 }
 

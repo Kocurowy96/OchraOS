@@ -1,54 +1,86 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! Processes: a program from the initramfs running in its own address space.
+//! Processes: programs from the initramfs, each in its own address space, as in Linux.
 //!
-//! Starting one ("exec") works like Linux's `execve`:
+//! Starting a program ("exec", [`load_program`]):
 //! 1. read the ELF file and map its segments (at a random address if it is position
 //!    independent — ASLR);
 //! 2. build the initial stack: the argument and environment strings, then, from the stack
 //!    pointer up: `argc`, the `argv` pointers, `NULL`, the `envp` pointers, `NULL`, and the
 //!    auxiliary vector ("auxv": pairs of type and value that tell the C library about the
 //!    program and the system, `man 3 getauxval`);
-//! 3. start a user task at the ELF entry point with that stack pointer.
+//! 3. run it from the ELF entry point with that stack pointer.
 //!
-//! For now a process has one task (thread), and it cannot `fork` yet (stage 2, P3).
+//! The life of a process (`man 2 fork`, `execve`, `wait4`, `_exit`):
+//! - `fork` copies the parent: memory (every page, eagerly), open files, registers;
+//! - `execve` replaces the program but keeps the process (its ID, parent, open files);
+//! - when it exits, its memory and files are released at once, but it stays in the process
+//!   table as a "zombie" until its parent collects the exit status with `wait4`;
+//! - its children go to init (PID 1), which collects them ("reparenting"). Without an init
+//!   (the user-program tests), orphans are collected by the kernel itself.
+//! - init must never end: that is a kernel panic, as in Linux.
+//!
+//! For now a process has one task (thread).
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use log::info;
 use ochra_frame::mm::FRAME_SIZE;
 use ochra_frame::mm::user::{USER_END, UserAccess, UserSpace};
 use ochra_frame::random;
 use ochra_frame::sync::IrqMutex;
 use ochra_frame::task;
+use ochra_frame::user_mode::UserContext;
 
 use crate::elf::{self, Elf, Kind};
-use crate::errno::{E2BIG, ENOENT, ENOEXEC, ENOMEM, Errno};
+use crate::errno::{E2BIG, ECHILD, ENOENT, ENOEXEC, ENOMEM, ESRCH, Errno};
+use crate::file::FdTable;
 use crate::initramfs;
 use crate::memory::{self, Memory, page_down, page_up};
+use crate::sched::{self, WaitQueue};
 
 pub struct Process {
     pub id: u32,
+    /// The parent's ID; 0 if the kernel started the process (or it was orphaned without
+    /// an init to take it).
+    parent: AtomicU32,
+    /// The process group (for `wait4` with a group); inherited, for now never changed.
+    group: AtomicU32,
     /// The program's path, for the log.
-    pub name: String,
-    pub space: Arc<UserSpace>,
+    name: IrqMutex<String>,
+    /// `None` once the process has exited.
+    space: IrqMutex<Option<Arc<UserSpace>>>,
     pub memory: IrqMutex<Memory>,
-    /// If set, what the program writes to stdout is collected here instead of going to the
-    /// console (the user-program tests compare it with the same program run on Linux).
-    pub captured_output: Option<IrqMutex<Vec<u8>>>,
+    pub files: IrqMutex<FdTable>,
     /// How the process ended, once it has.
     exit: IrqMutex<Option<Exit>>,
+    /// The parent is gone and nobody will `wait4`: the process is removed when it exits.
+    orphan: AtomicBool,
+    /// Woken when a child exits (`wait4` waits here).
+    children_changed: WaitQueue,
 }
 
-/// How a process ended (what `wait4` will report).
+/// How a process ended (what `wait4` reports).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
     /// It called `exit` with this status (0..=255).
     Status(u8),
     /// It was killed by this signal.
     Signal(u8),
+}
+
+impl Exit {
+    /// The status word `wait4` writes (`WIFEXITED`, `WEXITSTATUS`, `WTERMSIG` decode it).
+    pub fn wait_status(self) -> u32 {
+        match self {
+            Self::Status(status) => u32::from(status) << 8,
+            Self::Signal(signal) => u32::from(signal),
+        }
+    }
 }
 
 impl core::fmt::Display for Exit {
@@ -61,36 +93,52 @@ impl core::fmt::Display for Exit {
 }
 
 impl Process {
-    #[cfg_attr(
-        not(feature = "selftest"),
-        expect(
-            dead_code,
-            reason = "only the user-program tests wait for a process until wait4 (P3)"
-        )
-    )]
     pub fn exit(&self) -> Option<Exit> {
         *self.exit.lock()
     }
 
-    pub fn set_exit(&self, exit: Exit) {
-        *self.exit.lock() = Some(exit);
+    pub fn parent(&self) -> u32 {
+        self.parent.load(Ordering::Relaxed)
+    }
+
+    pub fn name(&self) -> String {
+        self.name.lock().clone()
+    }
+
+    /// The address space; `ESRCH` once the process has exited (it never runs then).
+    pub fn space(&self) -> Result<Arc<UserSpace>, Errno> {
+        self.space.lock().clone().ok_or(ESRCH)
     }
 }
 
-/// The process of the running task, if it is a user task.
-pub fn current() -> Option<Arc<Process>> {
-    task::current()?.data()?.clone().downcast::<Process>().ok()
-}
-
+/// Every process that exists, zombies included, by ID.
+static TABLE: IrqMutex<BTreeMap<u32, Arc<Process>>> = IrqMutex::new(BTreeMap::new());
+/// The ID of init, once started (0: none).
+static INIT: AtomicU32 = AtomicU32::new(0);
+/// Woken when a process the kernel started (parent 0) exits.
+static KERNEL_CHILDREN: WaitQueue = WaitQueue::new();
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
-/// Starts the program at `path` with the given arguments and environment.
-pub fn spawn(
+/// The process of the running task, if it is a user task with one.
+pub fn current() -> Option<Arc<Process>> {
+    let task = task::current()?;
+    sched::thread(&task).process.clone()
+}
+
+/// A program loaded into a new address space, ready to run.
+pub struct Image {
+    space: Arc<UserSpace>,
+    memory: Memory,
+    entry: u64,
+    stack_pointer: u64,
+}
+
+/// Loads the program at `path` with the given arguments and environment.
+pub fn load_program(
     path: &str,
-    arguments: &[&str],
-    environment: &[&str],
-    capture_output: bool,
-) -> Result<Arc<Process>, Errno> {
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+) -> Result<Image, Errno> {
     let file = initramfs::lookup(path).ok_or(ENOENT)?;
     let elf = elf::parse(file)?;
     let space = Arc::new(UserSpace::new().ok_or(ENOMEM)?);
@@ -107,22 +155,218 @@ pub fn spawn(
         environment,
         &loaded,
     )?;
+    Ok(Image {
+        space,
+        memory,
+        entry: loaded.entry,
+        stack_pointer,
+    })
+}
+
+/// Starts the program at `path` as a new process of the kernel (parent 0) with the given
+/// open files.
+pub fn spawn(
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+    files: FdTable,
+) -> Result<Arc<Process>, Errno> {
+    let image = load_program(path, arguments, environment)?;
     let process = Arc::new(Process {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        name: String::from(path),
-        space: space.clone(),
-        memory: IrqMutex::new(memory),
-        captured_output: capture_output.then(|| IrqMutex::new(Vec::new())),
+        parent: AtomicU32::new(0),
+        group: AtomicU32::new(0),
+        name: IrqMutex::new(String::from(path)),
+        space: IrqMutex::new(Some(image.space.clone())),
+        memory: IrqMutex::new(image.memory),
+        files: IrqMutex::new(files),
         exit: IrqMutex::new(None),
+        orphan: AtomicBool::new(false),
+        children_changed: WaitQueue::new(),
     });
-    crate::sched::spawn_user(
+    // A process started by the kernel leads its own group, as init does.
+    process.group.store(process.id, Ordering::Relaxed);
+    TABLE.lock().insert(process.id, process.clone());
+    sched::spawn_user(
         "user",
-        space,
-        loaded.entry,
-        stack_pointer,
+        image.space,
+        image.entry,
+        image.stack_pointer,
         Some(process.clone()),
     );
     Ok(process)
+}
+
+/// Makes `process` the init process: orphans go to it, and its end is a kernel panic.
+pub fn set_init(process: &Process) {
+    INIT.store(process.id, Ordering::Relaxed);
+}
+
+/// `fork`: a copy of `parent` that continues from `context` with 0 as the result. Returns
+/// the child's ID.
+pub fn fork(parent: &Arc<Process>, context: &UserContext) -> Result<u32, Errno> {
+    let space = Arc::new(parent.space()?.duplicate().ok_or(ENOMEM)?);
+    let child = Arc::new(Process {
+        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        parent: AtomicU32::new(parent.id),
+        group: AtomicU32::new(parent.group.load(Ordering::Relaxed)),
+        name: IrqMutex::new(parent.name()),
+        space: IrqMutex::new(Some(space.clone())),
+        memory: IrqMutex::new(parent.memory.lock().clone()),
+        files: IrqMutex::new(parent.files.lock().clone()),
+        exit: IrqMutex::new(None),
+        orphan: AtomicBool::new(false),
+        children_changed: WaitQueue::new(),
+    });
+    let id = child.id;
+    TABLE.lock().insert(id, child.clone());
+    sched::spawn_fork(space, context, child);
+    Ok(id)
+}
+
+/// `execve`: replaces the program of the current process. On success the caller's context
+/// starts the new program; on failure nothing has changed.
+pub fn exec(
+    process: &Process,
+    context: &mut UserContext,
+    path: &str,
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
+) -> Result<(), Errno> {
+    let image = load_program(path, arguments, environment)?;
+    // From here on nothing can fail: the old program is gone.
+    *process.memory.lock() = image.memory;
+    *process.space.lock() = Some(image.space.clone());
+    *process.name.lock() = String::from(path);
+    task::replace_space(image.space);
+    task::set_fs_base(0).expect("0 is a user address");
+    task::reset_fpu();
+    let closed = process.files.lock().take_close_on_exec();
+    drop(closed);
+    context.start_program(image.entry, image.stack_pointer);
+    Ok(())
+}
+
+/// Ends the current process: releases its memory and files, hands its children to init,
+/// tells its parent, and ends the task. The process stays a zombie until reaped.
+pub fn exit(process: &Arc<Process>, exit: Exit) -> ! {
+    let id = process.id;
+    if INIT.load(Ordering::Relaxed) == id {
+        panic!("init (process {id}) {exit}");
+    }
+    info!("process {id} ({}) {exit}", process.name());
+    // Closing the files may wake others (a pipe's other end), so not under the lock.
+    let files = core::mem::take(&mut *process.files.lock());
+    drop(files);
+    *process.memory.lock() = Memory::new(0);
+    // The task still runs in the address space; it is freed with the task.
+    let space = process.space.lock().take();
+    drop(space);
+    *process.exit.lock() = Some(exit);
+
+    let init = INIT.load(Ordering::Relaxed);
+    let parent = {
+        let mut table = TABLE.lock();
+        let mut orphans_exited = false;
+        let mut reaped = Vec::new();
+        for (&child_id, child) in table.iter() {
+            if child.parent() != id {
+                continue;
+            }
+            child.parent.store(init, Ordering::Relaxed);
+            if init == 0 {
+                child.orphan.store(true, Ordering::Relaxed);
+                if child.exit().is_some() {
+                    reaped.push(child_id);
+                }
+            } else if child.exit().is_some() {
+                orphans_exited = true;
+            }
+        }
+        for child_id in reaped {
+            table.remove(&child_id);
+        }
+        if orphans_exited && let Some(init) = table.get(&init) {
+            init.children_changed.wake_all();
+        }
+        if process.orphan.load(Ordering::Relaxed) {
+            table.remove(&id);
+        }
+        table.get(&process.parent()).cloned()
+    };
+    match parent {
+        Some(parent) => parent.children_changed.wake_all(),
+        None => KERNEL_CHILDREN.wake_all(),
+    }
+    sched::exit_current()
+}
+
+/// Which children `wait4` waits for.
+#[derive(Clone, Copy)]
+pub enum Selector {
+    Any,
+    Process(u32),
+    Group(u32),
+}
+
+/// `wait4`: waits for a child of `process` that matches `selector` to exit, removes it from
+/// the table and returns its ID and how it ended. With `no_hang`, returns `None` at once if
+/// no child has exited.
+pub fn wait(
+    process: &Process,
+    selector: Selector,
+    no_hang: bool,
+) -> Result<Option<(u32, Exit)>, Errno> {
+    process.children_changed.wait_until(|| {
+        let mut table = TABLE.lock();
+        let matches = |child: &Process| {
+            child.parent() == process.id
+                && match selector {
+                    Selector::Any => true,
+                    Selector::Process(id) => child.id == id,
+                    Selector::Group(group) => child.group.load(Ordering::Relaxed) == group,
+                }
+        };
+        let mut any = false;
+        let mut exited = None;
+        for child in table.values() {
+            if matches(child) {
+                any = true;
+                if let Some(exit) = child.exit() {
+                    exited = Some((child.id, exit));
+                    break;
+                }
+            }
+        }
+        match exited {
+            Some((id, exit)) => {
+                table.remove(&id);
+                Some(Ok(Some((id, exit))))
+            }
+            None if !any => Some(Err(ECHILD)),
+            None if no_hang => Some(Ok(None)),
+            None => None,
+        }
+    })
+}
+
+/// The process group of `process`, for `wait4(0, …)`.
+pub fn group(process: &Process) -> u32 {
+    process.group.load(Ordering::Relaxed)
+}
+
+/// Waits until `process`, started by the kernel, exits, and removes it from the table.
+#[cfg_attr(
+    not(feature = "selftest"),
+    expect(
+        dead_code,
+        reason = "only the user-program tests wait for kernel children"
+    )
+)]
+pub fn wait_kernel_child(process: &Process) -> Exit {
+    let exit = KERNEL_CHILDREN.wait_until(|| process.exit());
+    TABLE.lock().remove(&process.id);
+    exit
 }
 
 /// Where things go in a new address space; random within the ranges Linux uses on x86-64,
@@ -257,8 +501,8 @@ fn build_stack(
     memory: &mut Memory,
     top: u64,
     path: &str,
-    arguments: &[&str],
-    environment: &[&str],
+    arguments: &[&[u8]],
+    environment: &[&[u8]],
     loaded: &Loaded,
 ) -> Result<u64, Errno> {
     let mut stack = StackBuilder {
@@ -267,7 +511,7 @@ fn build_stack(
     };
     // Eight zero bytes at the very top, then the strings, each with its NUL.
     stack.push(&[0; 8]);
-    let execfn = stack.push_string(path);
+    let execfn = stack.push_string(path.as_bytes());
     let environment_addresses: Vec<u64> = environment
         .iter()
         .map(|text| stack.push_string(text))
@@ -344,8 +588,8 @@ impl StackBuilder {
         self.top - self.bytes.len() as u64
     }
 
-    fn push_string(&mut self, text: &str) -> u64 {
+    fn push_string(&mut self, text: &[u8]) -> u64 {
         self.push(&[0]);
-        self.push(text.as_bytes())
+        self.push(text)
     }
 }

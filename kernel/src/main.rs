@@ -16,8 +16,10 @@
 extern crate alloc;
 
 mod banner;
+mod console;
 mod elf;
 mod errno;
+mod file;
 mod initramfs;
 mod logger;
 mod memory;
@@ -147,10 +149,22 @@ fn start_init(command_line: &str) {
         .split_whitespace()
         .find_map(|argument| argument.strip_prefix("rdinit="))
         .unwrap_or("/init");
-    match process::spawn(path, &[path], &["HOME=/", "TERM=linux"], false) {
+    // Descriptors 0, 1 and 2 share one opening of the console, as after Linux opens
+    // `/dev/console` for init.
+    let console = file::OpenFile::new(alloc::sync::Arc::new(console::Console), 0);
+    let mut files = file::FdTable::default();
+    for fd in 0..3 {
+        let descriptor = file::Descriptor {
+            file: console.clone(),
+            close_on_exec: false,
+        };
+        let _ = files.insert_at(fd, descriptor);
+    }
+    let environment: [&[u8]; 2] = [b"HOME=/", b"TERM=linux"];
+    match process::spawn(path, &[path.as_bytes()], &environment, files) {
         Ok(process) => {
+            process::set_init(&process);
             info!("started {path} as process {}", process.id);
-            selftest::watch_init(&process);
         }
         Err(errno) => log::error!("cannot start {path} (errno {errno})"),
     }

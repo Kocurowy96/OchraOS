@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 //! Kernel tasks and the context switch: the mechanism of scheduling. The policy (which task
-//! runs next) lives in the safe kernel crate.
+//! runs next, when a task blocks) lives in the safe kernel crate.
 //!
 //! A task is a function running on its own stack. To switch from task P to task N, the CPU
 //! state P needs to continue later is saved on P's stack, P's stack pointer is stored in P's
@@ -26,21 +26,34 @@
 //! by the CPU that switches to the task, and cleared by [`switch`] only once the task's state
 //! is saved and the CPU has left its stack. A CPU waits for the flag to clear before it runs
 //! the task.
+//!
+//! A task that ends ([`exit_to`]) cannot free its own stack while running on it. It is parked
+//! in the per-CPU `reaped` slot, and the task that runs next on that CPU drops it right after
+//! the switch, when nothing uses the old stack any more.
+//!
+//! The fields a task's own CPU changes (saved stack pointer, FPU state, address space) are
+//! only touched by the CPU that runs the task, or that has claimed it through `on_cpu`.
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::arch::naked_asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::arch::exceptions::ExceptionFrame;
 use crate::arch::{cpu, interrupts};
 use crate::cpu_local;
 use crate::mm::paging::{self, KernelStack};
 use crate::mm::user::UserSpace;
 use crate::sync::IrqMutex;
+use crate::user_mode::{self, UserContext};
 
 /// Stack size of a task: 32 KiB (debug builds use a lot of stack for formatting).
 const STACK_PAGES: u64 = 8;
+
+/// The kernel's own record of a task, opaque to `ochra-frame`.
+pub type TaskData = Arc<dyn Any + Send + Sync>;
 
 /// A kernel task. Shared as `Arc<Task>` between the scheduler's queues and the CPU running it.
 pub struct Task {
@@ -53,17 +66,26 @@ pub struct Task {
     /// A CPU runs this task, or is still saving it (see the module documentation).
     on_cpu: AtomicBool,
     /// The user address space this task runs in; `None` for kernel-only tasks, which run on
-    /// the kernel's page tables.
-    space: Option<Arc<UserSpace>>,
-    /// For a user task: where it starts in user mode (instruction and stack pointer).
-    user_start: Option<(u64, u64)>,
+    /// the kernel's page tables. `execve` replaces it ([`replace_space`]).
+    space: UnsafeCell<Option<Arc<UserSpace>>>,
+    /// Whether the task runs user code (then FS base and the address space matter).
+    user: bool,
+    /// For a new user task: how it enters user mode; taken when it starts.
+    user_start: IrqMutex<Option<UserStart>>,
     /// The FS segment base of a user task: the thread pointer (TLS), set with `arch_prctl`.
     /// Loaded into the FS base MSR whenever the task is switched to.
     fs_base: AtomicU64,
-    /// What the kernel keeps about the task (its process), opaque to `ochra-frame`.
-    data: Option<Arc<dyn Any + Send + Sync>>,
+    data: Option<TaskData>,
     /// Owned so it lives as long as the task.
     _stack: KernelStack,
+}
+
+/// How a user task enters user mode the first time.
+enum UserStart {
+    /// A new program: this instruction pointer and stack pointer, other registers zero.
+    Fresh { entry: u64, stack: u64 },
+    /// A copy of another task's registers (`fork`).
+    Resume(Box<ExceptionFrame>),
 }
 
 /// The 512-byte area `fxsave` writes and `fxrstor` reads; it must be 16-byte aligned.
@@ -81,10 +103,9 @@ impl FpuState {
     }
 }
 
-// SAFETY: `saved_rsp` (and `fpu`) is only accessed by `switch_to` and `start`, with interrupts off: written
-// by `switch` on the CPU leaving the task, and read by a CPU that has claimed the task through
-// `on_cpu`, which happens only after the writer cleared it (release/acquire). So at most one
-// CPU touches it at a time. Everything else in `Task` is atomic or immutable.
+// SAFETY: the `UnsafeCell` fields are only accessed by the CPU running the task or by the CPU
+// that claimed it through `on_cpu` (release/acquire), so at most one CPU at a time; see the
+// module documentation. Everything else in `Task` is atomic, locked or immutable.
 unsafe impl Sync for Task {}
 // SAFETY: as above; nothing in a task is tied to the CPU that created it.
 unsafe impl Send for Task {}
@@ -98,13 +119,20 @@ impl Task {
         self.name
     }
 
-    /// The kernel's data for this task, given to [`spawn_user`].
-    pub fn data(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+    /// The kernel's data for this task, given when it was created.
+    pub fn data(&self) -> Option<&TaskData> {
         self.data.as_ref()
     }
 
     pub fn fs_base(&self) -> u64 {
         self.fs_base.load(Ordering::Relaxed)
+    }
+
+    /// The address space, read by the CPU that runs or has claimed the task.
+    fn space(&self) -> Option<&Arc<UserSpace>> {
+        // SAFETY: only that CPU writes the field (`replace_space` on the running task), and
+        // the reference does not outlive the switch (see the module documentation).
+        unsafe { (*self.space.get()).as_ref() }
     }
 }
 
@@ -115,9 +143,9 @@ const FS_BASE_MSR: u32 = 0xC000_0100;
 /// it. Fails for an address outside the user half: a kernel address there would let user
 /// code reach kernel memory through `fs:` (with SMAP off), and a non-canonical one would
 /// fault in the kernel when loaded.
-pub fn set_fs_base(value: u64) -> Result<(), crate::user_mode::BadAddress> {
+pub fn set_fs_base(value: u64) -> Result<(), user_mode::BadAddress> {
     if value >= crate::mm::user::USER_END {
-        return Err(crate::user_mode::BadAddress);
+        return Err(user_mode::BadAddress);
     }
     let were_enabled = interrupts::disable();
     let task = current_slot().lock().clone().expect("a task is running");
@@ -134,49 +162,96 @@ pub fn set_fs_base(value: u64) -> Result<(), crate::user_mode::BadAddress> {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Creates a kernel task that will run `entry` (with interrupts on) the first time it is
-/// switched to. Tasks do not end yet, hence `-> !`.
-pub fn spawn(name: &'static str, entry: fn() -> !) -> Arc<Task> {
-    spawn_in(name, entry, None)
+/// switched to; it ends with [`exit_to`].
+pub fn spawn(name: &'static str, entry: fn() -> !, data: Option<TaskData>) -> Arc<Task> {
+    create(name, entry, None, None, data)
 }
 
 /// Creates a user task: it runs in `space` and starts in user mode at `entry` with the stack
-/// pointer `stack`. Its kernel stack serves its syscalls and interrupts. `data` is the
-/// kernel's own record of the task, returned by [`Task::data`].
+/// pointer `stack`. Its kernel stack serves its syscalls and interrupts.
 pub fn spawn_user(
     name: &'static str,
     space: Arc<UserSpace>,
     entry: u64,
     stack: u64,
-    data: Option<Arc<dyn Any + Send + Sync>>,
+    data: Option<TaskData>,
 ) -> Arc<Task> {
-    create(
-        name,
-        start_user_task,
-        Some(space),
-        Some((entry, stack)),
-        data,
-    )
+    let start = UserStart::Fresh { entry, stack };
+    create(name, start_user_task, Some(space), Some(start), data)
 }
 
-/// Like [`spawn`], but the task runs with `space` loaded in CR3.
-pub fn spawn_in(name: &'static str, entry: fn() -> !, space: Option<Arc<UserSpace>>) -> Arc<Task> {
-    create(name, entry, space, None, None)
+/// Creates the child of `fork`: a user task in `space` that continues from the current
+/// task's user registers `context`, but sees 0 as the syscall's result. It also inherits the
+/// current task's FS base and x87/SSE registers. Call it from the parent's syscall.
+pub fn fork_user(
+    name: &'static str,
+    space: Arc<UserSpace>,
+    context: &UserContext,
+    data: Option<TaskData>,
+) -> Arc<Task> {
+    let mut frame = context.frame().clone();
+    frame.rax = 0;
+    let start = UserStart::Resume(Box::new(frame));
+    let task = create(name, start_user_task, Some(space), Some(start), data);
+    let parent = current().expect("fork runs in a task");
+    task.fs_base.store(parent.fs_base(), Ordering::Relaxed);
+    let were_enabled = interrupts::disable();
+    // SAFETY: the new task runs nowhere yet, so its FPU state is ours alone; the registers
+    // hold the parent's user state, which the kernel never changes.
+    unsafe { save_fpu(task.fpu.get()) };
+    if were_enabled {
+        interrupts::enable();
+    }
+    task
+}
+
+/// Replaces the current task's address space with `space` (for `execve`) and loads it. The
+/// old one is dropped once nothing else holds it.
+pub fn replace_space(space: Arc<UserSpace>) {
+    let were_enabled = interrupts::disable();
+    let task = current().expect("a task is running");
+    load_space(Some(&space));
+    // SAFETY: the running task's address space is only changed by itself, here, with
+    // interrupts off, so no switch reads it meanwhile.
+    let old = unsafe { (*task.space.get()).replace(space) };
+    if let Some(old) = &old {
+        old.note_unloaded();
+    }
+    if were_enabled {
+        interrupts::enable();
+    }
+    drop(old);
+}
+
+/// Gives the current task the x87/SSE state of a new program (for `execve`).
+pub fn reset_fpu() {
+    let initial = FpuState::initial();
+    // SAFETY: `initial` is a valid state (see `FpuState::initial`); it only replaces the
+    // current task's live registers, which the kernel itself never uses.
+    unsafe { load_fpu(&initial) };
 }
 
 /// First code of a user task, on its kernel stack: off to user mode.
 fn start_user_task() -> ! {
     let task = current().expect("a task is running");
-    let (entry, stack) = task.user_start.expect("only user tasks start here");
+    let start = task
+        .user_start
+        .lock()
+        .take()
+        .expect("only user tasks start here");
     drop(task);
-    crate::user_mode::enter(entry, stack)
+    match start {
+        UserStart::Fresh { entry, stack } => user_mode::enter(entry, stack),
+        UserStart::Resume(frame) => user_mode::resume(*frame),
+    }
 }
 
 fn create(
     name: &'static str,
     entry: fn() -> !,
     space: Option<Arc<UserSpace>>,
-    user_start: Option<(u64, u64)>,
-    data: Option<Arc<dyn Any + Send + Sync>>,
+    user_start: Option<UserStart>,
+    data: Option<TaskData>,
 ) -> Arc<Task> {
     let stack = KernelStack::new(STACK_PAGES);
     // The first switch to the task "returns" into `task_trampoline`, popping six zeroed
@@ -202,8 +277,9 @@ fn create(
         saved_rsp: UnsafeCell::new(rsp),
         fpu: UnsafeCell::new(FpuState::initial()),
         on_cpu: AtomicBool::new(false),
-        space,
-        user_start,
+        user: user_start.is_some(),
+        space: UnsafeCell::new(space),
+        user_start: IrqMutex::new(user_start),
         fs_base: AtomicU64::new(0),
         data,
         _stack: stack,
@@ -224,13 +300,12 @@ pub fn current() -> Option<Arc<Task>> {
 pub fn start(first: Arc<Task>) -> ! {
     interrupts::disable();
     claim(&first);
-    // SAFETY: `first` is claimed by this CPU, so its saved stack pointer is stable.
+    // SAFETY: `first` is claimed by this CPU, so its saved state is stable.
     let next_rsp = unsafe { *first.saved_rsp.get() };
     // SAFETY: as above, the claimed task's FPU state is ours to load.
     unsafe { load_fpu(first.fpu.get()) };
-    load_space(first.space.as_deref());
-    load_fs_base(&first);
-    cpu_local::set_kernel_stack(first._stack.top());
+    load_space(first.space().map(Arc::as_ref));
+    enter_task(&first);
     *current_slot().lock() = Some(first);
     // The boot stack's context and flag are throw-away variables: nothing ever switches back.
     let mut boot_rsp = 0;
@@ -256,39 +331,78 @@ pub fn switch_to(next: Arc<Task>) {
         return;
     }
     let previous_rsp = previous.saved_rsp.get();
+    let next_rsp = prepare_switch(&previous, &next);
+    // The per-CPU current task keeps `next` alive; `previous` stays alive in this stack frame
+    // while suspended, and the scheduler holds it too.
+    drop(next);
+    // SAFETY: `previous_rsp` and the `on_cpu` flag point into the current task's `Task`,
+    // alive (see above); `next_rsp` is the stack pointer `next` saved when it was switched
+    // away from (or the one `create` prepared), and `next` is claimed by this CPU. Interrupts
+    // are off, so nothing runs in between.
+    unsafe { switch(previous_rsp, next_rsp, previous.on_cpu.as_ptr()) };
+    drop(previous);
+    finish_switch();
+    if were_enabled {
+        interrupts::enable();
+    }
+}
+
+/// Ends the current task for good and continues `next`. The task is freed (with its kernel
+/// stack) by the next task on this CPU, once nothing runs on that stack any more.
+pub fn exit_to(next: Arc<Task>) -> ! {
+    interrupts::disable();
+    let previous = current_slot()
+        .lock()
+        .replace(next.clone())
+        .expect("task::start has run");
+    assert!(
+        !Arc::ptr_eq(&previous, &next),
+        "a task cannot exit to itself"
+    );
+    let previous_rsp = previous.saved_rsp.get();
+    let previous_on_cpu = previous.on_cpu.as_ptr();
+    let next_rsp = prepare_switch(&previous, &next);
+    drop(next);
+    // Kept alive until the switch is done; see `finish_switch`.
+    let slot = reaped_slot();
+    let _ = slot.lock().replace(previous);
+    // SAFETY: `previous_rsp` and `previous_on_cpu` point into the exiting task, kept alive
+    // by the `reaped` slot until `finish_switch` runs on the other side; `next` is claimed by
+    // this CPU and its saved stack pointer is valid; interrupts are off.
+    unsafe { switch(previous_rsp, next_rsp, previous_on_cpu) };
+    unreachable!("switched back to a task that exited");
+}
+
+/// The common part of a switch: claims `next` and loads its FPU state, address space, FS base
+/// and kernel stack. Returns `next`'s saved stack pointer.
+fn prepare_switch(previous: &Task, next: &Task) -> u64 {
     // SAFETY: `previous` is the task running on this CPU (still claimed: its `on_cpu` is only
-    // cleared by `switch` below), so nothing else touches its FPU state.
+    // cleared by `switch`), so nothing else touches its FPU state.
     unsafe { save_fpu(previous.fpu.get()) };
-    claim(&next);
-    // SAFETY: `next` is claimed by this CPU, so its saved stack pointer is stable.
+    claim(next);
+    // SAFETY: `next` is claimed by this CPU, so its saved state is stable.
     let next_rsp = unsafe { *next.saved_rsp.get() };
     // SAFETY: as above, the claimed task's FPU state is ours to load.
     unsafe { load_fpu(next.fpu.get()) };
-    let same_space = match (&previous.space, &next.space) {
+    let same_space = match (previous.space(), next.space()) {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
         _ => false,
     };
     if !same_space {
-        load_space(next.space.as_deref());
-        if let Some(space) = &previous.space {
+        load_space(next.space().map(Arc::as_ref));
+        if let Some(space) = previous.space() {
             space.note_unloaded();
         }
     }
-    load_fs_base(&next);
-    cpu_local::set_kernel_stack(next._stack.top());
-    // The per-CPU current task keeps `next` alive; `previous` stays alive in this stack frame while
-    // suspended, and the scheduler's queue holds it too.
-    drop(next);
-    // SAFETY: `previous_rsp` and the `on_cpu` flag point into the current task's `Task`,
-    // alive (see above); `next_rsp` is the stack pointer `next` saved when it was switched
-    // away from (or the one `spawn` prepared), and `next` is claimed by this CPU. Interrupts
-    // are off, so nothing runs in between.
-    unsafe { switch(previous_rsp, next_rsp, previous.on_cpu.as_ptr()) };
-    drop(previous);
-    if were_enabled {
-        interrupts::enable();
-    }
+    enter_task(next);
+    next_rsp
+}
+
+/// Runs right after every switch, on the new task's stack: frees a task that exited.
+fn finish_switch() {
+    let reaped = reaped_slot().lock().take();
+    drop(reaped);
 }
 
 /// Loads `space` (or the kernel's tables) into CR3 on this CPU. Runs on a kernel stack, which
@@ -307,6 +421,16 @@ fn load_space(space: Option<&UserSpace>) {
     unsafe { paging::write_cr3(root) };
 }
 
+/// Per-CPU state for the task about to run: its kernel stack (for interrupts and syscalls
+/// from user mode) and, for a user task, its FS base. (Kernel tasks do not use FS.)
+fn enter_task(task: &Task) {
+    cpu_local::set_kernel_stack(task._stack.top());
+    if task.user {
+        // SAFETY: `fs_base` only ever holds user addresses (`set_fs_base`); see there.
+        unsafe { cpu::write_msr(FS_BASE_MSR, task.fs_base()) };
+    }
+}
+
 /// # Safety
 ///
 /// `state` must be valid for writes, and no other CPU may access it.
@@ -323,16 +447,12 @@ unsafe fn load_fpu(state: *const FpuState) {
     // SAFETY: as above; an invalid MXCSR would raise #GP, but the state comes from `fxsave` or
     // from `initial`, whose MXCSR is valid.
     unsafe {
-        core::arch::asm!("fxrstor64 [{}]", in(reg) state, options(nostack, preserves_flags, readonly))
+        core::arch::asm!(
+            "fxrstor64 [{}]",
+            in(reg) state,
+            options(nostack, preserves_flags, readonly)
+        )
     };
-}
-
-/// Gives a user task its own FS base back. (Kernel tasks do not use FS.)
-fn load_fs_base(task: &Task) {
-    if task.user_start.is_some() {
-        // SAFETY: `fs_base` only ever holds user addresses (`set_fs_base`); see there.
-        unsafe { cpu::write_msr(FS_BASE_MSR, task.fs_base()) };
-    }
 }
 
 /// Marks `task` as running on this CPU, first waiting until the CPU that ran it before has
@@ -354,6 +474,13 @@ fn current_slot() -> &'static IrqMutex<Option<Arc<Task>>> {
         .current_task
 }
 
+/// This CPU's slot for a task that has just exited. Interrupts must be off.
+fn reaped_slot() -> &'static IrqMutex<Option<Arc<Task>>> {
+    &cpu_local::this()
+        .expect("per-CPU data is set up before tasks run")
+        .reaped_task
+}
+
 /// Saves the callee-saved registers and the stack pointer into `*previous_rsp`, then loads
 /// `next_rsp`, clears `*previous_on_cpu` (the previous task is now fully saved and its stack
 /// no longer in use) and restores the registers that were saved on the new stack.
@@ -361,7 +488,7 @@ fn current_slot() -> &'static IrqMutex<Option<Arc<Task>>> {
 /// # Safety
 ///
 /// `previous_rsp` and `previous_on_cpu` must be valid for a write; `next_rsp` must be a stack
-/// pointer saved by this function or prepared by [`spawn`], and nothing else may be using
+/// pointer saved by this function or prepared by [`create`], and nothing else may be using
 /// that stack.
 #[unsafe(naked)]
 unsafe extern "C" fn switch(previous_rsp: *mut u64, next_rsp: u64, previous_on_cpu: *mut bool) {
@@ -387,7 +514,7 @@ unsafe extern "C" fn switch(previous_rsp: *mut u64, next_rsp: u64, previous_on_c
     )
 }
 
-/// Where a new task starts: passes the entry function (in r12, see `spawn`) to `task_start`.
+/// Where a new task starts: passes the entry function (in r12, see `create`) to `task_start`.
 #[unsafe(naked)]
 extern "C" fn task_trampoline() -> ! {
     naked_asm!("mov rdi, r12", "call {start}", "ud2", start = sym task_start)
@@ -396,11 +523,13 @@ extern "C" fn task_trampoline() -> ! {
 /// `entry` is the task's `fn() -> !` as an address: a Rust `fn` type cannot cross the
 /// `extern "C"` boundary of the trampoline directly.
 extern "C" fn task_start(entry: usize) -> ! {
-    // SAFETY: `spawn` put a `fn() -> !` into r12, and the trampoline passes it on unchanged;
+    // SAFETY: `create` put a `fn() -> !` into r12, and the trampoline passes it on unchanged;
     // a `fn` pointer round-trips through `usize`.
     let entry = unsafe { core::mem::transmute::<usize, fn() -> !>(entry) };
-    // The task was switched to with interrupts off (from `start`, `switch_to`, or a timer
-    // interrupt handler); a new task begins with them on.
+    // A new task also arrives right after a switch.
+    finish_switch();
+    // The task was switched to with interrupts off (from `start`, `switch_to`, `exit_to`, or
+    // a timer interrupt handler); a new task begins with them on.
     interrupts::enable();
     entry()
 }

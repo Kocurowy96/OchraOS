@@ -57,17 +57,6 @@ pub fn run(name: &str) {
 static USER_TESTS_RUNNING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// The first user program, watched so that "boot finished" comes only after it has ended.
-#[cfg(feature = "selftest")]
-static INIT: ochra_frame::sync::IrqMutex<Option<alloc::sync::Arc<crate::process::Process>>> =
-    ochra_frame::sync::IrqMutex::new(None);
-
-/// Called with the process started as `/init`.
-pub fn watch_init(_process: &alloc::sync::Arc<crate::process::Process>) {
-    #[cfg(feature = "selftest")]
-    INIT.lock().replace(_process.clone());
-}
-
 /// Whether `test=usertests` is on the command line; then `/init` is not started.
 pub fn runs_user_tests(command_line: &str) -> bool {
     cfg!(feature = "selftest")
@@ -76,10 +65,12 @@ pub fn runs_user_tests(command_line: &str) -> bool {
             .any(|argument| argument == "test=usertests")
 }
 
-/// Runs the test programs from `/tests`, one at a time, each with its stdout captured, and
-/// logs one line per program: how it ended, and its output in hexadecimal (so the line
-/// stays one line whatever the program printed). `cargo xtask test` runs the same programs
-/// on the host Linux and compares.
+/// Runs the test programs from `/tests`, one at a time, and logs one line per program: how
+/// it ended, and its output in hexadecimal (so the line stays one line whatever the program
+/// printed). `cargo xtask test` runs the same programs on the host Linux and compares.
+///
+/// As on the host, stdin is empty (`/dev/null`), stdout is a pipe read until its end (so
+/// output from children that outlive the program counts too), stderr is the console.
 #[cfg(feature = "selftest")]
 fn run_user_tests() -> ! {
     use alloc::vec::Vec;
@@ -89,38 +80,77 @@ fn run_user_tests() -> ! {
         .collect();
     names.sort_unstable();
     for name in &names {
-        let path = alloc::format!("/tests/{name}");
-        let process = match crate::process::spawn(&path, &[&path], &[], true) {
-            Ok(process) => process,
-            Err(errno) => panic!("user test {name}: cannot start it (errno {errno})"),
-        };
-        // No wait queues yet (P3): look again after every timer tick.
-        let exit = loop {
-            if let Some(exit) = process.exit() {
-                break exit;
-            }
-            ochra_frame::arch::interrupts::wait();
-        };
-        let output = process
-            .captured_output
-            .as_ref()
-            .map(|output| output.lock().clone())
-            .unwrap_or_default();
+        let (ending, output) = run_user_test(name);
         let hex: alloc::string::String = output
             .iter()
             .map(|byte| alloc::format!("{byte:02x}"))
             .collect();
-        let ending = match exit {
-            crate::process::Exit::Status(status) => alloc::format!("exit {status}"),
-            crate::process::Exit::Signal(signal) => alloc::format!("signal {signal}"),
-        };
         log::info!("user test {name}: {ending}, output {hex}");
     }
     log::info!("user tests: {} programs finished", names.len());
-    USER_TESTS_RUNNING.store(false, core::sync::atomic::Ordering::Release);
-    loop {
-        ochra_frame::arch::interrupts::wait();
+
+    // Everything a process had (pages, page tables, kernel stack) must come back. The first
+    // round also grew the kernel heap, so compare two more rounds with each other.
+    let mut free = [0; 2];
+    for round in &mut free {
+        for name in &names {
+            run_user_test(name);
+        }
+        // Exited tasks are freed by the next switch on their CPU: a few ticks are plenty.
+        let start = crate::time::ticks();
+        while crate::time::ticks() < start + 3 {
+            ochra_frame::arch::interrupts::wait();
+        }
+        *round = ochra_frame::mm::frames::stats().free;
     }
+    let leaked = free[0].saturating_sub(free[1]);
+    assert_eq!(leaked, 0, "user tests: {leaked} frames leaked in one round");
+    log::info!("user tests: no frames leaked over two more rounds");
+    USER_TESTS_RUNNING.store(false, core::sync::atomic::Ordering::Release);
+    crate::sched::exit_current()
+}
+
+/// Runs one test program from `/tests` and returns how it ended (`exit N` or `signal N`) and
+/// what it wrote to stdout.
+#[cfg(feature = "selftest")]
+fn run_user_test(name: &str) -> (alloc::string::String, alloc::vec::Vec<u8>) {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+
+    use crate::file::{self, Descriptor, FdTable, Null, OpenFile};
+
+    let path = alloc::format!("/tests/{name}");
+    let (reader, writer) = file::pipe();
+    let mut files = FdTable::default();
+    let descriptor = |file, mode| Descriptor {
+        file: OpenFile::new(file, mode),
+        close_on_exec: false,
+    };
+    for (fd, file) in [
+        (0, Arc::new(Null) as Arc<dyn file::File>),
+        (1, writer),
+        (2, Arc::new(crate::console::Console)),
+    ] {
+        let _ = files.insert_at(fd, descriptor(file, 0));
+    }
+    let process = match crate::process::spawn(&path, &[path.as_bytes()], &[], files) {
+        Ok(process) => process,
+        Err(errno) => panic!("user test {name}: cannot start it (errno {errno})"),
+    };
+    let mut output = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        match reader.read(&mut buffer, false) {
+            Ok(0) => break,
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(errno) => panic!("user test {name}: reading its output failed ({errno})"),
+        }
+    }
+    let ending = match crate::process::wait_kernel_child(&process) {
+        crate::process::Exit::Status(status) => alloc::format!("exit {status}"),
+        crate::process::Exit::Signal(signal) => alloc::format!("signal {signal}"),
+    };
+    (ending, output)
 }
 
 /// Recurses until the task's stack runs into its guard page. The page fault handler then
@@ -423,15 +453,11 @@ fn spawn_user_program(name: &'static str) {
 #[cfg(not(feature = "selftest"))]
 pub fn spawn_tasks() {}
 
-/// Whether the tasks from [`spawn_tasks`], the user tests and `/init` are done.
+/// Whether the tasks from [`spawn_tasks`] and the user tests are done.
 pub fn tasks_finished() -> bool {
     #[cfg(feature = "selftest")]
     return TASKS_DONE.load(core::sync::atomic::Ordering::Acquire) == 2
-        && !USER_TESTS_RUNNING.load(core::sync::atomic::Ordering::Acquire)
-        && INIT
-            .lock()
-            .as_ref()
-            .is_none_or(|init| init.exit().is_some());
+        && !USER_TESTS_RUNNING.load(core::sync::atomic::Ordering::Acquire);
     #[cfg(not(feature = "selftest"))]
     true
 }

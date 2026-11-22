@@ -35,7 +35,7 @@ use crate::{SHOW_ADDRESSES, serial};
 /// The stack contents when `handle_exception` is called, lowest address first:
 /// the registers saved by `common_entry`, then what the stub and the CPU pushed.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ExceptionFrame {
     pub(crate) r15: u64,
     pub(crate) r14: u64,

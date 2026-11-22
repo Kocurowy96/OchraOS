@@ -241,6 +241,48 @@ impl UserSpace {
         Ok(())
     }
 
+    /// A copy of this address space with copies of all its pages (for `fork`), or `None` if
+    /// memory runs out. The copy is eager: every page is copied now (copy-on-write later).
+    pub fn duplicate(&self) -> Option<Self> {
+        let copy = Self::new()?;
+        let _guard = self.lock.lock();
+        let mut ok = true;
+        // SAFETY: `root` is this space's live PML4, and we hold its lock, so its tables do
+        // not change while we read them.
+        unsafe {
+            for_each_page(self.root, 4, 0, &mut |virt, value| {
+                if !ok {
+                    return;
+                }
+                ok = copy.copy_page(virt, value);
+            })
+        };
+        ok.then_some(copy)
+    }
+
+    /// Maps a copy of the frame in the level-1 entry `value` at `virt`, with the same bits.
+    fn copy_page(&self, virt: u64, value: u64) -> bool {
+        let Some(mut frame) = super::frames::allocate() else {
+            return false;
+        };
+        let source = direct_map(PhysAddr(value & ADDRESS_MASK));
+        // SAFETY: the source is a frame owned by the space being copied (whose lock the
+        // caller holds), read through the direct map; the new frame is ours.
+        let bytes = unsafe { core::slice::from_raw_parts(source, FRAME_SIZE as usize) };
+        frame.write_bytes(0, bytes);
+        let _guard = self.lock.lock();
+        let mut created = 0;
+        // SAFETY: `root` is this (new) space's live PML4, changed only under `lock`.
+        let entry =
+            unsafe { paging::walk(self.root, virt, 1, Create::Yes { user: true }, &mut created) };
+        let Some(entry) = entry else {
+            return false;
+        };
+        // SAFETY: `walk` returned an entry of this space; the frame's ownership moves into it.
+        unsafe { entry.write(frame.into_address().0 | (value & !ADDRESS_MASK)) };
+        true
+    }
+
     /// The physical address of the PML4, for CR3.
     pub(crate) fn root(&self) -> PhysAddr {
         self.root
@@ -315,6 +357,32 @@ unsafe fn free_table(table: PhysAddr, level: u32, range: core::ops::Range<usize>
         }
         // SAFETY: the entry owned this frame (a page or a table), and nothing uses it now.
         drop(unsafe { Frame::from_address(address) });
+    }
+}
+
+/// Calls `visit(virtual address, entry)` for every level-1 entry that owns a frame, in the
+/// user half of the table at `level` covering addresses from `base`.
+///
+/// # Safety
+///
+/// The table must be a live page table that does not change during the walk.
+unsafe fn for_each_page(table: PhysAddr, level: u32, base: u64, visit: &mut dyn FnMut(u64, u64)) {
+    let entries = direct_map(table).cast::<u64>();
+    // Only the lower (user) half of the PML4.
+    let count = if level == 4 { 256 } else { 512 };
+    let span = FRAME_SIZE << (9 * (level - 1));
+    for index in 0..count {
+        // SAFETY: `index < 512`, inside the table frame, reached through the direct map.
+        let value = unsafe { entries.add(index).read() };
+        let virt = base + index as u64 * span;
+        if level == 1 {
+            if value & OWNED != 0 {
+                visit(virt, value);
+            }
+        } else if value & PRESENT != 0 {
+            // SAFETY: a present entry above level 1 points to a lower table of this space.
+            unsafe { for_each_page(PhysAddr(value & ADDRESS_MASK), level - 1, virt, visit) };
+        }
     }
 }
 

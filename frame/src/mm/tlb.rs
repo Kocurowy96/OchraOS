@@ -93,6 +93,14 @@ pub(super) fn flush(root: PhysAddr, start: u64, pages: u64, on_other_cpus: bool)
     }
 }
 
+/// The `root` of a request for kernel pages: they are mapped in every address space.
+const ALL_SPACES: u64 = u64::MAX;
+
+/// Flushes `pages` kernel pages (shared by every address space) on every CPU.
+pub(super) fn flush_kernel(start: u64, pages: u64) {
+    flush(PhysAddr(ALL_SPACES), start, pages, true);
+}
+
 /// Answers the current request if this CPU has not done so yet.
 fn answer() {
     let Some(cpu) = cpu_local::this() else {
@@ -112,10 +120,11 @@ fn answer() {
 /// Flushes the pages on this CPU, if it is using that address space.
 fn flush_local(root: PhysAddr, start: u64, pages: u64) {
     let current = read_cr3() & ADDRESS_MASK;
-    if current != root.0 {
+    if root.0 != ALL_SPACES && current != root.0 {
         return;
     }
-    if pages > MAX_SINGLE_FLUSHES {
+    // Kernel pages are global: reloading CR3 would not drop them, so always `invlpg`.
+    if root.0 != ALL_SPACES && pages > MAX_SINGLE_FLUSHES {
         // SAFETY: reloading the current CR3 changes no mapping; it only empties the TLB.
         unsafe { write_cr3(PhysAddr(current)) };
         return;

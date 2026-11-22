@@ -5,12 +5,13 @@
 //! Every `.c` file is one static program. By default it is a static PIE (position-independent,
 //! so the kernel can load it at a random address); files named `*_nopie.c` are built as a
 //! classic static executable at a fixed address, so the kernel's loader is tested with both
-//! kinds.
+//! kinds. Files named `*_nostart.c` have no C library at all: they bring their own `_start`,
+//! to see exactly what the kernel hands a new program.
 //!
 //! Layout of the initramfs:
 //!
 //! ```text
-//! /init           userspace/hello.c for now (the first program the kernel starts)
+//! /init           userspace/init.c (the first program the kernel starts)
 //! /bin/<name>     userspace/<name>.c
 //! /tests/<name>   userspace/tests/<name>.c (syscall tests, compared with the host Linux)
 //! ```
@@ -46,11 +47,19 @@ pub fn build() -> Result<(PathBuf, Vec<Program>)> {
                 .ok_or("bad file name")?
                 .to_string();
             let file = out.join(format!("{}-{name}", &prefix[1..]));
-            compile(&musl, &source, &file, !name.ends_with("_nopie"))?;
-            programs.push(Program {
-                path: format!("{prefix}/{name}"),
-                file,
-            });
+            let kind = if name.ends_with("_nopie") {
+                Kind::Fixed
+            } else if name.ends_with("_nostart") {
+                Kind::NoLibrary
+            } else {
+                Kind::PositionIndependent
+            };
+            compile(&musl, &source, &file, kind)?;
+            let path = match (prefix, name.as_str()) {
+                ("/bin", "init") => "/init".to_string(),
+                _ => format!("{prefix}/{name}"),
+            };
+            programs.push(Program { path, file });
         }
     }
 
@@ -60,9 +69,6 @@ pub fn build() -> Result<(PathBuf, Vec<Program>)> {
     for program in &programs {
         let data = std::fs::read(&program.file)?;
         archive.file(&program.path[1..], 0o755, &data);
-        if program.path == "/bin/hello" {
-            archive.file("init", 0o755, &data);
-        }
     }
     let initramfs = build_dir()?.join("initramfs.cpio");
     std::fs::write(&initramfs, archive.finish())?;
@@ -79,9 +85,17 @@ fn c_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    PositionIndependent,
+    Fixed,
+    NoLibrary,
+}
+
 /// Compiles and links one program with the host GCC against musl only (no host headers or
 /// libraries): musl's start files, `libc.a`, and GCC's own `libgcc.a` for compiler helpers.
-fn compile(musl: &Path, source: &Path, output: &Path, pie: bool) -> Result<()> {
+fn compile(musl: &Path, source: &Path, output: &Path, kind: Kind) -> Result<()> {
+    let pie = kind == Kind::PositionIndependent;
     let gcc_include = gcc_output(&["-print-file-name=include"])?;
     let libgcc = gcc_output(&["-print-libgcc-file-name"])?;
     let object = output.with_extension("o");
@@ -97,6 +111,13 @@ fn compile(musl: &Path, source: &Path, output: &Path, pie: bool) -> Result<()> {
             "-nostdinc",
         ])
         .arg(if pie { "-fPIE" } else { "-fno-pie" })
+        // Without a C library, the compiler must not call one (`strlen` for a loop, the
+        // stack protector's `__stack_chk_fail`).
+        .args(if kind == Kind::NoLibrary {
+            &["-ffreestanding", "-fno-stack-protector"][..]
+        } else {
+            &[]
+        })
         .arg("-isystem")
         .arg(musl.join("include"))
         .arg("-isystem")
@@ -106,6 +127,14 @@ fn compile(musl: &Path, source: &Path, output: &Path, pie: bool) -> Result<()> {
         .arg("-o")
         .arg(&object))?;
 
+    if kind == Kind::NoLibrary {
+        // Only the program itself (and GCC's helpers): its own `_start`, no C library.
+        return run(Command::new("gcc")
+            .args(["-nostdlib", "-static", "-no-pie", "-o"])
+            .arg(output)
+            .arg(&object)
+            .arg(&libgcc));
+    }
     let start = if pie { "rcrt1.o" } else { "crt1.o" };
     let mut link = Command::new("gcc");
     link.arg("-nostdlib");
