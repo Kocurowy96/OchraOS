@@ -22,7 +22,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 use super::FRAME_SIZE;
 use super::paging::{self, KERNEL_REGIONS_BASE};
@@ -37,13 +37,13 @@ const GROW_STEP: u64 = 256 * 1024;
 const BLOCK: usize = 16;
 
 #[global_allocator]
-static HEAP: Heap = Heap(Mutex::new(FreeList {
+static HEAP: Heap = Heap(IrqMutex::new(FreeList {
     head: ptr::null_mut(),
     end: HEAP_BASE,
     used: 0,
 }));
 
-struct Heap(Mutex<FreeList>);
+struct Heap(IrqMutex<FreeList>);
 
 /// Header written at the start of every free block.
 #[repr(C, align(16))]

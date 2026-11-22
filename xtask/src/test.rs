@@ -22,8 +22,12 @@ struct Case {
     name: &'static str,
     /// Kernel command line.
     command_line: &'static str,
+    /// Extra QEMU arguments (a later `-cpu` replaces the default one).
+    qemu_args: &'static [&'static str],
     /// Lines that must appear in the log, in this order (each matched as a substring).
     expected: &'static [&'static str],
+    /// Lines that must appear somewhere in the kernel log, in any order.
+    anywhere: &'static [&'static str],
 }
 
 /// Lines that must appear in every boot, before the kernel does anything case-specific.
@@ -36,8 +40,12 @@ const BOOT: &[&str] = &[
     "physical memory:",
     "page tables:",
     "heap:",
+    "interrupts: legacy PIC masked, local APIC in",
+    "timer: local APIC timer at 100 Hz",
     "self-test frames: ok",
     "self-test heap: ok",
+    "self-test interrupts: ok",
+    "self-test timer: ok",
     "breakpoint (int3) at",
 ];
 
@@ -45,72 +53,96 @@ const CASES: &[Case] = &[
     Case {
         name: "boot",
         command_line: "",
+        qemu_args: &[],
         expected: &["boot finished, halting"],
+        anywhere: &[],
     },
     Case {
         name: "pagefault",
         command_line: "test=pagefault",
+        qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Page fault (#PF, vector 14)",
             "write to a non-present page, in kernel mode",
             "address  0x00000000deadbeef",
             "system halted",
         ],
+        anywhere: &[],
     },
     Case {
         name: "doublefault",
         command_line: "test=doublefault",
+        qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Double fault (#DF, vector 8)",
             "system halted",
         ],
+        anywhere: &[],
     },
     Case {
         name: "wx",
         command_line: "test=wx",
+        qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Page fault (#PF, vector 14)",
             "write to a page without the needed permission, in kernel mode",
             "system halted",
         ],
+        anywhere: &[],
     },
     Case {
         name: "nx",
         command_line: "test=nx",
+        qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Page fault (#PF, vector 14)",
             "instruction fetch from a page without the needed permission, in kernel mode",
             "system halted",
         ],
+        anywhere: &[],
     },
     Case {
         name: "guardpage",
         command_line: "test=guardpage",
+        qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Page fault (#PF, vector 14)",
             "write to a non-present page, in kernel mode",
             "system halted",
         ],
+        anywhere: &[],
     },
     Case {
         name: "smep",
         command_line: "test=smep",
+        qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Page fault (#PF, vector 14)",
             "instruction fetch from a page without the needed permission, in kernel mode",
             "address  0x0000000010000000",
             "system halted",
         ],
+        anywhere: &[],
     },
     Case {
         name: "smap",
         command_line: "test=smap",
+        qemu_args: &[],
         expected: &[
             "CPU EXCEPTION: Page fault (#PF, vector 14)",
             "read from a page without the needed permission, in kernel mode",
             "address  0x0000000010000000",
             "system halted",
         ],
+        anywhere: &[],
+    },
+    // The same boot on a CPU without x2APIC, so the xAPIC (memory-mapped) path is tested too.
+    Case {
+        name: "xapic",
+        command_line: "",
+        qemu_args: &["-cpu", "max,-x2apic"],
+        expected: &["boot finished, halting"],
+        anywhere: &["local APIC in xAPIC mode"],
     },
 ];
 
@@ -136,7 +168,7 @@ pub fn run() -> Result<()> {
     for case in CASES {
         image::create(&image, &kernel, &bootloader, case.command_line)?;
         step(&format!("test {}: booting", case.name));
-        let log = boot(&image)?;
+        let log = boot(&image, case.qemu_args)?;
         std::fs::write(build_dir()?.join(format!("test-{}.log", case.name)), &log)?;
         kernel_addresses.extend(kernel_virtual_address(&log));
 
@@ -174,9 +206,10 @@ pub fn run() -> Result<()> {
 }
 
 /// Boots `image` headless and returns the serial output with colour codes removed.
-fn boot(image: &Path) -> Result<String> {
+fn boot(image: &Path, extra_args: &[&str]) -> Result<String> {
     let mut qemu = qemu::command(image)?;
     qemu.args(["-display", "none", "-serial", "stdio", "-monitor", "none"])
+        .args(extra_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
     let mut child = qemu.spawn()?;
@@ -247,6 +280,12 @@ fn check(case: &Case, log: &str) -> std::result::Result<(), String> {
         match rest.find(expected) {
             Some(position) => rest = &rest[position + expected.len()..],
             None => return Err(format!("missing (or out of order): {expected:?}")),
+        }
+    }
+
+    for line in case.anywhere {
+        if !kernel_log.contains(line) {
+            return Err(format!("missing: {line:?}"));
         }
     }
 

@@ -121,13 +121,28 @@ unsafe fn write_cr4(value: u64) {
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nostack, preserves_flags)) };
 }
 
-fn read_msr(msr: u32) -> u64 {
+/// Reads a model-specific register.
+pub(crate) fn read_msr(msr: u32) -> u64 {
     let (low, high): (u32, u32);
-    // SAFETY: only called with architectural MSRs that every x86-64 CPU has (EFER); reading
-    // them has no side effects.
+    // SAFETY: only called with MSRs that exist on every CPU we run on (EFER, APIC base) or
+    // after CPUID confirmed them (x2APIC registers); reading them has no side effects.
     unsafe {
         asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high,
              options(nomem, nostack, preserves_flags));
     }
     (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Writes a model-specific register.
+///
+/// # Safety
+///
+/// The MSR must exist, and the value must not break anything the kernel relies on.
+pub(crate) unsafe fn write_msr(msr: u32, value: u64) {
+    let (low, high) = (value as u32, (value >> 32) as u32);
+    // SAFETY: guaranteed by the caller.
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high,
+             options(nostack, preserves_flags));
+    }
 }

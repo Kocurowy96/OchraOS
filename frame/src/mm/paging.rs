@@ -30,12 +30,13 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use spin::{Mutex, Once};
+use spin::Once;
 
 use super::frames;
 use super::{FRAME_SIZE, PhysAddr, direct_map};
 use crate::arch::gdt;
 use crate::boot::{BootInfo, MemoryKind};
+use crate::sync::IrqMutex;
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
@@ -45,6 +46,10 @@ const HUGE: u64 = 1 << 7;
 /// Kept in the TLB across CR3 switches; for mappings shared by every address space.
 const GLOBAL: u64 = 1 << 8;
 const NO_EXECUTE: u64 = 1 << 63;
+/// Write-through and cache-disable: together they make a page uncached, as device registers
+/// must be (a cached write might never reach the device).
+const WRITE_THROUGH: u64 = 1 << 3;
+const CACHE_DISABLE: u64 = 1 << 4;
 /// Bits 12..51 of an entry: the physical address of the next table or of the page.
 const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
@@ -115,6 +120,14 @@ impl AddressSpace {
         let entry = self.walk(virt, 1, access.user);
         // SAFETY: `walk` returns a pointer to an entry inside a live page table frame.
         unsafe { set_entry(entry, phys.0 | access.entry_bits(), virt) };
+    }
+
+    /// Maps the 4 KiB page at `virt` to device registers at `phys`: uncached, kernel only.
+    fn map_device_page(&mut self, virt: u64, phys: PhysAddr) {
+        let entry = self.walk(virt, 1, false);
+        let bits = Access::DATA.entry_bits() | WRITE_THROUGH | CACHE_DISABLE;
+        // SAFETY: `walk` returns a pointer to an entry inside a live page table frame.
+        unsafe { set_entry(entry, phys.0 | bits, virt) };
     }
 
     /// Maps the 2 MiB page at `virt` (2 MiB aligned) to `phys` (2 MiB aligned).
@@ -188,12 +201,16 @@ fn entry_pointer(table: PhysAddr, virt: u64, level: u32) -> *mut u64 {
 }
 
 /// The kernel's address space, after [`init`].
-static KERNEL_SPACE: Once<Mutex<AddressSpace>> = Once::new();
+static KERNEL_SPACE: Once<IrqMutex<AddressSpace>> = Once::new();
 
 /// Where kernel stacks go: PML4 slot 509, far from the kernel image (slot 511) and the direct
 /// map (Limine puts it in the lower slots of the higher half). The heap uses slot 508.
 const STACKS_BASE: u64 = 0xFFFF_FE80_0000_0000;
-/// Lowest address of the kernel's own regions (heap and stacks); the direct map must end below.
+/// Where device registers are mapped: PML4 slot 510.
+const DEVICES_BASE: u64 = 0xFFFF_FF00_0000_0000;
+static NEXT_DEVICE_PAGE: AtomicU64 = AtomicU64::new(DEVICES_BASE);
+/// Lowest address of the kernel's own regions (heap, stacks, devices); the direct map must
+/// end below.
 pub(crate) const KERNEL_REGIONS_BASE: u64 = 0xFFFF_FE00_0000_0000;
 /// Virtual space per stack. Only the top part is mapped; everything below stays unmapped, so
 /// each stack has at least one guard page under it.
@@ -309,7 +326,7 @@ pub fn init(boot: &BootInfo) -> Report {
 
     let root = space.root;
     report.page_tables = space.tables;
-    KERNEL_SPACE.call_once(|| Mutex::new(space));
+    KERNEL_SPACE.call_once(|| IrqMutex::new(space));
 
     // SAFETY: the new tables map everything the kernel uses from now on: its code, data and
     // stack-less statics (the image), the current stack, Limine's answers, the frame bitmap
@@ -325,6 +342,18 @@ pub fn init(boot: &BootInfo) -> Report {
 
     report.page_tables = kernel_space().lock().tables;
     report
+}
+
+/// Maps `pages` pages of device registers starting at `physical`, uncached, and returns the
+/// virtual address.
+pub(crate) fn map_device(physical: PhysAddr, pages: u64) -> u64 {
+    let start = NEXT_DEVICE_PAGE.fetch_add(pages * FRAME_SIZE, Ordering::Relaxed);
+    let mut space = kernel_space().lock();
+    for page in 0..pages {
+        let offset = page * FRAME_SIZE;
+        space.map_device_page(start + offset, PhysAddr(physical.0 + offset));
+    }
+    start
 }
 
 /// Maps `pages` fresh, zeroed frames as kernel data at `start`. Returns `None` when physical
@@ -343,7 +372,7 @@ pub(crate) fn map_new_pages(start: u64, pages: u64) -> Option<()> {
     Some(())
 }
 
-fn kernel_space() -> &'static Mutex<AddressSpace> {
+fn kernel_space() -> &'static IrqMutex<AddressSpace> {
     KERNEL_SPACE
         .get()
         .expect("paging::init runs before kernel stacks are created")

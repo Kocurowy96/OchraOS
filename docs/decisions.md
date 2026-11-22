@@ -4,6 +4,8 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | Interrupts: legacy PIC remapped to 32–47 and masked; local APIC in x2APIC mode, xAPIC (MMIO, uncached mapping in PML4 slot 510) as fallback; timer vector 0x30, spurious 0xFF; all `frame` locks are `IrqMutex` (interrupts off while held) | modern interrupt path only; no same-CPU deadlock between a lock holder and an interrupt handler |
+| 2026-11-22 | Timer: LAPIC timer in periodic mode at 100 Hz, calibrated over 10 ms with PIT channel 2 | the PIT has a known frequency on every PC; 10 ms is a reasonable first time slice; TSC-deadline can replace it later |
 | 2026-11-22 | Kernel heap: own first-fit free list sorted by address, merging neighbours, 16-byte granularity, in PML4 slot 508, grows on demand; no allocator crate | simple to read and verify; size classes can come later if profiling asks for them |
 | 2026-11-22 | Kernel virtual layout: image in slot 511 (KASLR), direct map at Limine's random offset, heap slot 508, kernel stacks slot 509 in 64 KiB slots (guard page below each); checked at boot | fixed, documented regions; the guard pages cost no memory |
 | 2026-11-22 | Physical frames are owned `Frame` handles (no Copy, freed on drop), as in Asterinas | safe kernel code cannot double-free or use a frame after freeing it |

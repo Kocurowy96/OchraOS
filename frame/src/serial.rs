@@ -9,7 +9,7 @@
 
 use core::fmt;
 
-use spin::Mutex;
+use crate::sync::IrqMutex;
 
 use crate::arch::port::{inb, outb};
 
@@ -18,7 +18,7 @@ const COM1_BASE: u16 = 0x3F8;
 
 /// The shared COM1 port. The lock makes sure two CPUs (later) never mix their bytes in the
 /// middle of a line.
-pub static COM1: Mutex<SerialPort> = Mutex::new(
+pub static COM1: IrqMutex<SerialPort> = IrqMutex::new(
     // SAFETY: COM1 is the standard PC serial port and this is the only regular owner of it;
     // the panic handler's emergency writer is documented in `SerialPort::new`.
     unsafe { SerialPort::new(COM1_BASE) },

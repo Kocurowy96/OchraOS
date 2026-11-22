@@ -50,6 +50,8 @@ pub fn run(name: &str) {
 pub fn run_checks() {
     check_frames();
     check_heap();
+    check_interrupts();
+    check_timer();
 }
 
 /// Runs every check. Without the `selftest` feature it does nothing.
@@ -196,4 +198,56 @@ fn check_heap() {
         "self-test heap: ok ({} KiB mapped after growing)",
         after.mapped / 1024
     );
+}
+
+/// Interrupts: an interrupt sent through the local APIC reaches the handler registered for
+/// its vector (and the end-of-interrupt lets the next one through: the timer keeps ticking).
+#[cfg(feature = "selftest")]
+fn check_interrupts() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use ochra_frame::arch::{apic, interrupts};
+
+    const VECTOR: u8 = 0x40;
+    static RECEIVED: AtomicU32 = AtomicU32::new(0);
+    fn handler(vector: u8) {
+        assert_eq!(vector, VECTOR, "self-test interrupts: wrong vector");
+        RECEIVED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    interrupts::set_handler(VECTOR, handler);
+    for round in 1..=3 {
+        apic::send_self_ipi(VECTOR);
+        // Each `wait` returns after at least one interrupt (the IPI or a timer tick), so this
+        // gives the IPI plenty of chances without depending on how fast the machine is.
+        for _ in 0..100 {
+            if RECEIVED.load(Ordering::Relaxed) == round {
+                break;
+            }
+            interrupts::wait();
+        }
+        assert_eq!(
+            RECEIVED.load(Ordering::Relaxed),
+            round,
+            "self-test interrupts: IPI {round} not received"
+        );
+    }
+    log::info!("self-test interrupts: ok (3 self-IPIs on vector {VECTOR:#x})");
+}
+
+/// Timer: ticks keep arriving. Only the order of events is checked, never how long they take
+/// (emulation in CI is not stable in time).
+#[cfg(feature = "selftest")]
+fn check_timer() {
+    use ochra_frame::arch::interrupts;
+
+    let start = crate::time::ticks();
+    for _ in 0..1000 {
+        if crate::time::ticks() >= start + 5 {
+            break;
+        }
+        interrupts::wait();
+    }
+    let seen = crate::time::ticks() - start;
+    assert!(seen >= 5, "self-test timer: only {seen} ticks");
+    log::info!("self-test timer: ok ({seen} ticks)");
 }

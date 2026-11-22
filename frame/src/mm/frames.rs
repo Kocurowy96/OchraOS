@@ -15,13 +15,14 @@
 
 use core::fmt;
 
-use spin::{Mutex, Once};
+use spin::Once;
 
 use super::{FRAME_SIZE, PhysAddr, direct_map};
 use crate::boot::{BootInfo, MemoryKind};
+use crate::sync::IrqMutex;
 
 /// The allocator, created once by [`init`]. The lock makes it safe to use from several CPUs.
-static ALLOCATOR: Once<Mutex<Bitmap>> = Once::new();
+static ALLOCATOR: Once<IrqMutex<Bitmap>> = Once::new();
 
 /// One owned 4 KiB frame of physical memory. Dropping it frees the frame.
 pub struct Frame {
@@ -112,11 +113,11 @@ pub fn stats() -> Stats {
 
 /// Builds the allocator from the memory map. Call once, early; later calls do nothing.
 pub fn init(boot: &BootInfo) -> Stats {
-    ALLOCATOR.call_once(|| Mutex::new(Bitmap::new(boot)));
+    ALLOCATOR.call_once(|| IrqMutex::new(Bitmap::new(boot)));
     stats()
 }
 
-fn allocator() -> &'static Mutex<Bitmap> {
+fn allocator() -> &'static IrqMutex<Bitmap> {
     ALLOCATOR
         .get()
         .expect("frames::init is called before the first allocation")

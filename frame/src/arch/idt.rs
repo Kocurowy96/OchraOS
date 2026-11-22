@@ -14,8 +14,8 @@ use core::mem::size_of;
 
 use spin::Once;
 
-use super::exceptions;
 use super::gdt::{self, DescriptorTablePointer};
+use super::{exceptions, interrupts};
 
 /// One IDT entry ("gate"), 16 bytes, as the CPU expects it. Aligning every entry to its own
 /// size also aligns the whole table, which Intel recommends for speed.
@@ -80,6 +80,9 @@ pub fn init() {
             };
             idt[vector] = Gate::new(*entry as usize as u64, ist);
         }
+        for vector in interrupts::FIRST_VECTOR..=u8::MAX {
+            idt[usize::from(vector)] = Gate::new(interrupts::stub_address(vector), 0);
+        }
         idt
     });
 
@@ -88,8 +91,8 @@ pub fn init() {
         base: idt.as_ptr() as u64,
     };
     // SAFETY: the IDT is in a `static Once`, so it lives forever and never changes after
-    // `call_once`; every present gate points to an entry stub in `exceptions` and uses the
-    // kernel code selector loaded by `gdt::init`.
+    // `call_once`; every gate points to an entry stub (`exceptions` for 0–31, `interrupts`
+    // for 32–255) and uses the kernel code selector loaded by `gdt::init`.
     unsafe {
         asm!("lidt [{0}]", in(reg) &pointer, options(readonly, nostack, preserves_flags));
     }

@@ -18,10 +18,11 @@ extern crate alloc;
 mod banner;
 mod logger;
 mod selftest;
+mod time;
 
 use log::{debug, info, trace};
 use ochra_frame::BootInfo;
-use ochra_frame::arch::{self, exceptions};
+use ochra_frame::arch::{self, apic, exceptions, interrupts, pic};
 use ochra_frame::boot::MemoryKind;
 use ochra_frame::mm::{FRAME_SIZE, frames, heap, paging};
 
@@ -61,6 +62,20 @@ fn main(boot: &'static BootInfo) -> ! {
     let heap = heap::init();
     info!("heap: {} KiB mapped, grows on demand", heap.mapped / 1024);
 
+    let local_apic = apic::init();
+    pic::disable();
+    info!(
+        "interrupts: legacy PIC masked, local APIC in {} mode (id {})",
+        local_apic.kind, local_apic.id
+    );
+    interrupts::set_handler(apic::TIMER_VECTOR, time::on_tick);
+    let timer = apic::start_timer(time::HZ);
+    info!(
+        "timer: local APIC timer at {} Hz ({} counts/ms, calibrated with the PIT)",
+        timer.hz, timer.counts_per_ms
+    );
+    interrupts::enable();
+
     selftest::run_checks();
     exceptions::breakpoint_self_test();
 
@@ -72,7 +87,10 @@ fn main(boot: &'static BootInfo) -> ! {
         selftest::run(test);
     }
 
-    info!("boot finished, halting");
+    info!(
+        "boot finished, halting ({} timer ticks so far)",
+        time::ticks()
+    );
     arch::halt_forever();
 }
 

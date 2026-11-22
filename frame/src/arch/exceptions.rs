@@ -28,7 +28,7 @@ use core::fmt::Write;
 
 use log::info;
 
-use crate::arch::halt_forever;
+use crate::arch::{halt_forever, interrupts};
 use crate::color::{BOLD, RED, RESET};
 use crate::{SHOW_ADDRESSES, serial};
 
@@ -62,6 +62,13 @@ pub struct ExceptionFrame {
     rflags: u64,
     rsp: u64,
     ss: u64,
+}
+
+impl ExceptionFrame {
+    /// The vector number of the exception or interrupt.
+    pub fn vector(&self) -> u64 {
+        self.vector
+    }
 }
 
 /// Defines one entry stub. `error_code` marks the vectors where the CPU pushes an error
@@ -168,7 +175,7 @@ pub static ENTRY_POINTS: [extern "C" fn(); 32] = [
 /// (5 qwords), error code, vector and 15 registers make 22 qwords = 176 bytes, a multiple of
 /// 16, so RSP is aligned at the `call` as the System V ABI requires.
 #[unsafe(naked)]
-extern "C" fn common_entry() {
+pub(super) extern "C" fn common_entry() {
     naked_asm!(
         "push rax",
         "push rbx",
@@ -217,6 +224,10 @@ const DOUBLE_FAULT: u64 = 8;
 const PAGE_FAULT: u64 = 14;
 
 extern "C" fn handle_exception(frame: &ExceptionFrame) {
+    if frame.vector >= u64::from(interrupts::FIRST_VECTOR) {
+        interrupts::dispatch(frame);
+        return;
+    }
     if frame.vector == BREAKPOINT {
         // `int3` is only ever placed on purpose, never inside the logger, so taking the
         // COM1 lock here cannot deadlock. RIP already points past the 1-byte instruction.

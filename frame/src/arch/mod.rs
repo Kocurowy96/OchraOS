@@ -2,10 +2,14 @@
 
 //! x86-64 specific code: CPU tables, exceptions, port I/O and other inline assembly.
 
+pub mod apic;
 pub mod cpu;
 pub mod exceptions;
 pub(crate) mod gdt;
 pub(crate) mod idt;
+pub mod interrupts;
+pub mod pic;
+mod pit;
 pub(crate) mod port;
 
 use core::arch::asm;

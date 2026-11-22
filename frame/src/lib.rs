@@ -27,6 +27,7 @@ mod panic;
 #[cfg(feature = "selftest")]
 pub mod selftest;
 pub mod serial;
+pub mod sync;
 
 pub use boot::BootInfo;
 
