@@ -24,12 +24,13 @@ Midnight and Sunflower need manual contrast checks.
 ## Mascots
 
 Three cats based on the owner's cats, each with an ochre accent.
+Tazi honours the owner's British Longhair, who passed away at just four years old.
 
 | Mascot | Breed | Accent | Role |
 | --- | --- | --- | --- |
 | Bursztyn | ginger Maine Coon | ochre fur, pine collar | face of the system: logo, installer, Ochra Welcome |
 | Selenit | white Devon Rex | ochre ear tips or collar | developers: Nightly, Beta, SDK, crash screens |
-| Tanzanit "Tazi" | blue British Longhair with a white bib | copper-ochre eyes | Ochra Guard: permission prompts, lock screen |
+| Tanzanit "Tazi" [R.I.P] | blue British Longhair with a white bib | copper-ochre eyes | Ochra Guard: permission prompts, lock screen |
 
 - Style: **chibi** (big heads and eyes, soft shapes, blush), chosen from three concept directions
   (geometric, chibi, line and colour blob) on 2026-11-22.
