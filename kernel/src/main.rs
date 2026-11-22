@@ -21,6 +21,8 @@ mod sched;
 mod selftest;
 mod time;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use log::{debug, info, trace};
 use ochra_frame::BootInfo;
 use ochra_frame::arch::{self, apic, exceptions, interrupts, pic};
@@ -103,12 +105,15 @@ fn main(boot: &'static BootInfo) -> ! {
     // From here on the kernel runs as tasks, each on its own stack with a guard page; the
     // boot stack (Limine's) is left behind.
     selftest::spawn_tasks();
-    sched::spawn("idle", idle);
-    sched::start();
+    // One idle task per CPU, so every CPU always has something to run.
+    for _ in 0..smp::cpu_count() {
+        sched::spawn("idle", idle);
+    }
+    sched::start(true);
 }
 
-/// Where the other CPUs (APs) arrive once their CPU state is set up. For now they only take
-/// timer interrupts; they join the scheduler later in stage 1.5.
+/// Where the other CPUs (APs) arrive once their CPU state is set up. They start their timer
+/// and join the scheduler.
 fn ap_main(cpu: CpuInfo) -> ! {
     let local_apic = apic::init();
     apic::start_timer(time::HZ);
@@ -118,20 +123,23 @@ fn ap_main(cpu: CpuInfo) -> ! {
     );
     interrupts::enable();
     selftest::on_ap(cpu.index);
-    loop {
-        interrupts::wait();
-    }
+    sched::start(false);
 }
+
+static BOOT_FINISHED: AtomicBool = AtomicBool::new(false);
 
 /// Runs when no other task has work: sleeps until the next interrupt.
 fn idle() -> ! {
     while !selftest::tasks_finished() {
         interrupts::wait();
     }
-    info!(
-        "boot finished, idling ({} timer ticks so far)",
-        time::ticks()
-    );
+    // Every idle task gets here; only the first one reports.
+    if !BOOT_FINISHED.swap(true, Ordering::Relaxed) {
+        info!(
+            "boot finished, idling ({} timer ticks so far)",
+            time::ticks()
+        );
+    }
     loop {
         interrupts::wait();
     }

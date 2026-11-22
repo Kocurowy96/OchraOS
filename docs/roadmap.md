@@ -38,7 +38,7 @@ Checklist:
 - [x] boot test checks that tasks A and B interleave (order only, never timing: TCG in CI is
       not stable in time)
 
-## Stage 1.5 — SMP
+## Stage 1.5 — SMP ✅
 
 Start the other CPU cores (application processors), per-CPU GDT/TSS/IST and data, scheduler
 on every core.
@@ -52,8 +52,8 @@ Checklist:
 - [x] own GDT, TSS and double fault stack (with a guard page) on every CPU + crash test
 - [x] local APIC and timer on every CPU (calibrated once)
 - [x] a panic or fatal exception stops every CPU
-- [ ] scheduler on every CPU (one global run queue, an idle task per CPU)
-- [ ] boot test: tasks run on at least two CPUs (order and set only, never timing); a
+- [x] scheduler on every CPU (one global run queue, an idle task per CPU)
+- [x] boot test: tasks run on at least two CPUs (order and set only, never timing); a
       single-CPU boot still works
 
 ## Stage 2 — Linux ABI

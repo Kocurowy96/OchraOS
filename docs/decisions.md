@@ -4,6 +4,8 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | SMP scheduling: one global run queue for all CPUs, one idle task per CPU; every task has an `on_cpu` flag (as in Linux), cleared by the context switch only after the task is saved and its stack left, and a CPU waits for it before running the task | simplest correct design; a task put back into the queue cannot be started twice; per-CPU queues with work stealing can come when profiling asks for them |
+| 2026-11-22 | TLB shootdown is deferred to stage 2: the kernel only adds mappings so far, and the CPU never caches non-present entries | no stale translations can exist until something is unmapped (process address spaces) |
 | 2026-11-22 | Every CPU runs its own local APIC (mode chosen once on the boot CPU, mode bit set per core) and its own periodic timer; the timer is calibrated once against the PIT, on the boot CPU, before the APs start | one PIT to measure with; all cores share the timer clock |
 | 2026-11-22 | A panic or fatal exception stops the other CPUs with an NMI ("all excluding self"); they confirm, and the report says how many stopped; a second crashing CPU halts quietly | an NMI also reaches CPUs spinning with interrupts off; nothing runs on after a crash |
 | 2026-11-22 | SMP: APs are started by Limine (MP request), not by an own INIT-SIPI-SIPI trampoline; CPUs get logical indexes (boot CPU 0) | no 16/32-bit start-up code and far less `unsafe`; Limine leaves every AP in 64-bit mode |

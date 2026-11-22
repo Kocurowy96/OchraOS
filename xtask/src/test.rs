@@ -208,14 +208,17 @@ pub fn run() -> Result<()> {
     let mut failed = Vec::new();
     let mut kernel_addresses = Vec::new();
     let mut boot_log = String::new();
+    let mut one_cpu_log = String::new();
     for case in CASES {
         image::create(&image, &kernel, &bootloader, case.command_line)?;
         step(&format!("test {}: booting", case.name));
         let log = boot(&image, case.qemu_args)?;
         std::fs::write(build_dir()?.join(format!("test-{}.log", case.name)), &log)?;
         kernel_addresses.extend(kernel_virtual_address(&log));
-        if case.name == "boot" {
-            boot_log = log.clone();
+        match case.name {
+            "boot" => boot_log = log.clone(),
+            "onecpu" => one_cpu_log = log.clone(),
+            _ => {}
         }
 
         match check(case, &log) {
@@ -239,8 +242,9 @@ pub fn run() -> Result<()> {
         failed.push("kaslr");
     }
 
-    step("test scheduler: tasks A and B take turns");
-    match check_interleaving(&boot_log) {
+    // On one CPU, A and B can only make progress together if the timer switches between them.
+    step("test scheduler: on one CPU, tasks A and B take turns");
+    match check_interleaving(&one_cpu_log) {
         Ok(switches) => eprintln!("    ok ({switches} switches between A and B)"),
         Err(problem) => {
             eprintln!("    FAILED: {problem}");
@@ -248,8 +252,18 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Stage 1.5 "Done when": with four CPUs, the tasks run on more than one of them.
+    step("test smp: tasks run on more than one CPU");
+    match check_cpus_used(&boot_log) {
+        Ok(cpus) => eprintln!("    ok (task steps ran on {} CPUs: {cpus:?})", cpus.len()),
+        Err(problem) => {
+            eprintln!("    FAILED: {problem}");
+            failed.push("smp");
+        }
+    }
+
     if failed.is_empty() {
-        step(&format!("all {} tests passed", CASES.len() + 2));
+        step(&format!("all {} tests passed", CASES.len() + 3));
         Ok(())
     } else {
         Err(format!(
@@ -376,6 +390,26 @@ fn check_interleaving(log: &str) -> std::result::Result<usize, String> {
         ));
     }
     Ok(switches)
+}
+
+/// The CPUs (from the `cpuN]` log prefix) on which tasks A and B logged their steps. Only the
+/// set counts, never timing: which CPU picks a task up after a tick is up to the scheduler.
+fn check_cpus_used(log: &str) -> std::result::Result<Vec<u32>, String> {
+    let mut cpus: Vec<u32> = log
+        .lines()
+        .filter(|line| line.contains("task A: step") || line.contains("task B: step"))
+        .filter_map(|line| line.split(" cpu").nth(1)?.split(']').next()?.parse().ok())
+        .collect();
+    let steps = cpus.len();
+    if steps != 10 {
+        return Err(format!("tasks A and B logged {steps} of 10 steps"));
+    }
+    cpus.sort();
+    cpus.dedup();
+    if cpus.len() < 2 {
+        return Err(format!("all task steps ran on cpu {cpus:?}"));
+    }
+    Ok(cpus)
 }
 
 /// The virtual address from the log line "loaded at physical …, virtual 0x…".

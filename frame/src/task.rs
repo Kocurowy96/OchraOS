@@ -15,11 +15,17 @@
 //! the task is picked again and returns from the interrupt.
 //!
 //! Every task stack is a [`KernelStack`] with a guard page below it.
+//!
+//! With several CPUs, a task put back into the run queue can be picked by another CPU while
+//! the old one is still saving it. So every task has an `on_cpu` flag (as in Linux): it is set
+//! by the CPU that switches to the task, and cleared by [`switch`] only once the task's state
+//! is saved and the CPU has left its stack. A CPU waits for the flag to clear before it runs
+//! the task.
 
 use alloc::sync::Arc;
 use core::arch::naked_asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::interrupts;
 use crate::cpu_local;
@@ -35,13 +41,16 @@ pub struct Task {
     name: &'static str,
     /// Saved stack pointer while the task is not running.
     saved_rsp: UnsafeCell<u64>,
+    /// A CPU runs this task, or is still saving it (see the module documentation).
+    on_cpu: AtomicBool,
     /// Owned so it lives as long as the task.
     _stack: KernelStack,
 }
 
-// SAFETY: `saved_rsp` is only accessed by `switch_to` and `start`, with interrupts off, for the
-// task that is being switched away from (written) or to (read) on this CPU; a task runs on at
-// most one CPU at a time. Everything else in `Task` is immutable.
+// SAFETY: `saved_rsp` is only accessed by `switch_to` and `start`, with interrupts off: written
+// by `switch` on the CPU leaving the task, and read by a CPU that has claimed the task through
+// `on_cpu`, which happens only after the writer cleared it (release/acquire). So at most one
+// CPU touches it at a time. Everything else in `Task` is atomic or immutable.
 unsafe impl Sync for Task {}
 // SAFETY: as above; nothing in a task is tied to the CPU that created it.
 unsafe impl Send for Task {}
@@ -83,6 +92,7 @@ pub fn spawn(name: &'static str, entry: fn() -> !) -> Arc<Task> {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         name,
         saved_rsp: UnsafeCell::new(rsp),
+        on_cpu: AtomicBool::new(false),
         _stack: stack,
     })
 }
@@ -97,17 +107,19 @@ pub fn current() -> Option<Arc<Task>> {
     task
 }
 
-/// Leaves the boot stack for good and runs `first`. Call once, from the boot code.
+/// Leaves this CPU's boot stack for good and runs `first`. Call once on every CPU.
 pub fn start(first: Arc<Task>) -> ! {
     interrupts::disable();
-    // SAFETY: reading the new task's saved stack pointer; it is not running anywhere yet.
+    claim(&first);
+    // SAFETY: `first` is claimed by this CPU, so its saved stack pointer is stable.
     let next_rsp = unsafe { *first.saved_rsp.get() };
     *current_slot().lock() = Some(first);
-    // The boot stack's context is saved into a throw-away variable: nothing ever switches back.
+    // The boot stack's context and flag are throw-away variables: nothing ever switches back.
     let mut boot_rsp = 0;
-    // SAFETY: `next_rsp` was prepared by `spawn`; the boot stack is abandoned, so whatever
-    // `switch` saves there is never used.
-    unsafe { switch(&mut boot_rsp, next_rsp) };
+    let boot_on_cpu = AtomicBool::new(true);
+    // SAFETY: `next_rsp` belongs to the claimed `first`; the boot stack is abandoned, so what
+    // `switch` saves there is never used (it stays mapped, so the writes are harmless).
+    unsafe { switch(&mut boot_rsp, next_rsp, boot_on_cpu.as_ptr()) };
     unreachable!("switched back to the boot stack");
 }
 
@@ -126,19 +138,32 @@ pub fn switch_to(next: Arc<Task>) {
         return;
     }
     let previous_rsp = previous.saved_rsp.get();
-    // SAFETY: `next` is not running (it is not the current task, and there is one CPU), so
-    // its saved stack pointer is stable.
+    claim(&next);
+    // SAFETY: `next` is claimed by this CPU, so its saved stack pointer is stable.
     let next_rsp = unsafe { *next.saved_rsp.get() };
     // The per-CPU current task keeps `next` alive; `previous` stays alive in this stack frame while
     // suspended, and the scheduler's queue holds it too.
     drop(next);
-    // SAFETY: `previous_rsp` points into the current task's `Task`, alive (see above);
-    // `next_rsp` is the stack pointer `next` saved when it was switched away from (or the
-    // one `spawn` prepared). Interrupts are off, so nothing runs in between.
-    unsafe { switch(previous_rsp, next_rsp) };
+    // SAFETY: `previous_rsp` and the `on_cpu` flag point into the current task's `Task`,
+    // alive (see above); `next_rsp` is the stack pointer `next` saved when it was switched
+    // away from (or the one `spawn` prepared), and `next` is claimed by this CPU. Interrupts
+    // are off, so nothing runs in between.
+    unsafe { switch(previous_rsp, next_rsp, previous.on_cpu.as_ptr()) };
     drop(previous);
     if were_enabled {
         interrupts::enable();
+    }
+}
+
+/// Marks `task` as running on this CPU, first waiting until the CPU that ran it before has
+/// finished saving it. The wait is short: that CPU is inside `switch_to` with interrupts off.
+fn claim(task: &Task) {
+    while task
+        .on_cpu
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
     }
 }
 
@@ -150,14 +175,16 @@ fn current_slot() -> &'static IrqMutex<Option<Arc<Task>>> {
 }
 
 /// Saves the callee-saved registers and the stack pointer into `*previous_rsp`, then loads
-/// `next_rsp` and restores the registers that were saved there.
+/// `next_rsp`, clears `*previous_on_cpu` (the previous task is now fully saved and its stack
+/// no longer in use) and restores the registers that were saved on the new stack.
 ///
 /// # Safety
 ///
-/// `previous_rsp` must be valid for a write; `next_rsp` must be a stack pointer saved by
-/// this function or prepared by [`spawn`], and nothing else may be using that stack.
+/// `previous_rsp` and `previous_on_cpu` must be valid for a write; `next_rsp` must be a stack
+/// pointer saved by this function or prepared by [`spawn`], and nothing else may be using
+/// that stack.
 #[unsafe(naked)]
-unsafe extern "C" fn switch(previous_rsp: *mut u64, next_rsp: u64) {
+unsafe extern "C" fn switch(previous_rsp: *mut u64, next_rsp: u64, previous_on_cpu: *mut bool) {
     naked_asm!(
         "push rbp",
         "push rbx",
@@ -167,6 +194,9 @@ unsafe extern "C" fn switch(previous_rsp: *mut u64, next_rsp: u64) {
         "push r15",
         "mov [rdi], rsp",
         "mov rsp, rsi",
+        // A plain store is a release on x86-64: the saved stack pointer above becomes visible
+        // to other CPUs before the cleared flag.
+        "mov byte ptr [rdx], 0",
         "pop r15",
         "pop r14",
         "pop r13",
