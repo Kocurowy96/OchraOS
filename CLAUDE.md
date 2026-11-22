@@ -62,6 +62,9 @@ The owner's machine is Garuda Linux (Arch-based). OVMF lives in `/usr/share/edk2
    - Never add a `Signed-off-by:` line yourself — only a human can certify the DCO.
    - Do not add a `Co-Authored-By:` trailer. Instead end the proposed message with
      `Assisted-by: Claude:<model-id>`.
+   - Always give the proposed message also as a ready-to-paste command, one `-m` per
+     paragraph, each paragraph on a single line, no backticks, `$` or `!` inside the quotes:
+     `git commit -s -m "<subject>" -m "<body>" -m "Assisted-by: Claude:<model-id>"`
 10. **Journal.** Before the session ends, add an entry to `journal/YYYY-MM-DD.md`:
     what was done, what is broken, what is next.
 11. **Language:** every file in the repository is in English. Talk to the owner in Polish.

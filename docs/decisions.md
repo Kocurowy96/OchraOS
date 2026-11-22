@@ -4,6 +4,7 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | Kernel linked as a static executable — **temporary**; back to PIE for KASLR (Limine relocates the kernel) at the latest in stage 1, together with paging | simplest start for stage 0; KASLR from `docs/security.md` needs a relocatable kernel |
 | 2026-11-22 | Limine built from its pinned source release (SHA-256 checked) by `cargo xtask` | no binaries in the repository; the source tarball is reproducible and verifiable |
 | 2026-11-22 | `limine` crate pinned to 0.5.0 (protocol base revision 3) | 0.6 needs nightly (`ptr_metadata`); revision 3 has everything stage 0–1 need |
 | 2026-11-22 | Toolchain: pinned Rust stable, not nightly | reproducible builds; naked functions (stable since 1.88) replace the nightly `x86-interrupt` ABI |
