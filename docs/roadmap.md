@@ -2,7 +2,7 @@
 
 Every stage ends with something that can be run and checked. No dates — this is a hobby project.
 
-## Stage 0 — Foundation
+## Stage 0 — Foundation ✅
 
 Rust `no_std` kernel, Limine bootloader (UEFI), QEMU, serial logging, `cargo xtask`, CI.
 
@@ -15,7 +15,7 @@ Checklist:
 - [x] serial logger (COM1), coloured output (ochre `#CC7722`, pine `#047857`)
 - [x] GDT, IDT, readable exception handlers (page fault, double fault)
 - [x] `cargo xtask build|run|test`
-- [ ] GitHub Actions: fmt, clippy, build, headless boot test
+- [x] GitHub Actions: fmt, clippy, build, headless boot test
 
 ## Stage 1 — Core
 
