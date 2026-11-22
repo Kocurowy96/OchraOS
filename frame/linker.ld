@@ -30,13 +30,18 @@ SECTIONS
     /* -2 GiB: lets the compiler use the compact "kernel" code model (32-bit signed addresses). */
     . = 0xffffffff80000000;
 
+    /* The __kernel_* symbols mark the segment boundaries for the page table code
+     * (frame/src/mm/paging.rs), which maps each segment with its own permissions. */
+    __kernel_text_start = .;
     .text : {
         *(.text .text.*)
     } :text
+    __kernel_text_end = .;
 
     /* Each segment starts on a new page, so a page never mixes two kinds of permission. */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
+    __kernel_rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
     } :rodata
@@ -47,9 +52,11 @@ SECTIONS
     .hash     : { *(.hash) } :rodata
     .dynstr   : { *(.dynstr) } :rodata
     .rela.dyn : { *(.rela.dyn) } :rodata
+    __kernel_rodata_end = .;
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
 
+    __kernel_data_start = .;
     .data : {
         /* Limine scans the area between the start and end markers for requests and writes
          * its responses back into them, so they must be writable. KEEP stops the linker from
@@ -74,6 +81,7 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
     } :data
+    __kernel_data_end = .;
 
     /* Unwinding tables and notes are useless without unwinding; drop them. */
     /DISCARD/ : {

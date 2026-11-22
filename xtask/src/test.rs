@@ -33,6 +33,11 @@ const BOOT: &[&str] = &[
     "bootloader: Limine",
     "GDT, TSS and IDT loaded",
     "CPU protections:",
+    "physical memory:",
+    "page tables:",
+    "heap:",
+    "self-test frames: ok",
+    "self-test heap: ok",
     "breakpoint (int3) at",
 ];
 
@@ -57,6 +62,53 @@ const CASES: &[Case] = &[
         command_line: "test=doublefault",
         expected: &[
             "CPU EXCEPTION: Double fault (#DF, vector 8)",
+            "system halted",
+        ],
+    },
+    Case {
+        name: "wx",
+        command_line: "test=wx",
+        expected: &[
+            "CPU EXCEPTION: Page fault (#PF, vector 14)",
+            "write to a page without the needed permission, in kernel mode",
+            "system halted",
+        ],
+    },
+    Case {
+        name: "nx",
+        command_line: "test=nx",
+        expected: &[
+            "CPU EXCEPTION: Page fault (#PF, vector 14)",
+            "instruction fetch from a page without the needed permission, in kernel mode",
+            "system halted",
+        ],
+    },
+    Case {
+        name: "guardpage",
+        command_line: "test=guardpage",
+        expected: &[
+            "CPU EXCEPTION: Page fault (#PF, vector 14)",
+            "write to a non-present page, in kernel mode",
+            "system halted",
+        ],
+    },
+    Case {
+        name: "smep",
+        command_line: "test=smep",
+        expected: &[
+            "CPU EXCEPTION: Page fault (#PF, vector 14)",
+            "instruction fetch from a page without the needed permission, in kernel mode",
+            "address  0x0000000010000000",
+            "system halted",
+        ],
+    },
+    Case {
+        name: "smap",
+        command_line: "test=smap",
+        expected: &[
+            "CPU EXCEPTION: Page fault (#PF, vector 14)",
+            "read from a page without the needed permission, in kernel mode",
+            "address  0x0000000010000000",
             "system halted",
         ],
     },

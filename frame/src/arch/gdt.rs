@@ -24,9 +24,8 @@
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
+use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
-
-use spin::Once;
 
 /// Kernel code segment selector (GDT index 2, ring 0). A selector is `index * 8 | ring`.
 pub const KERNEL_CODE: u16 = 2 * 8;
@@ -55,13 +54,32 @@ const KERNEL_DATA_DESCRIPTOR: u64 = 0x00CF_9300_0000_FFFF;
 /// memory never changes (and could even put it in read-only memory).
 static GDT: [AtomicU64; ENTRIES] = [const { AtomicU64::new(0) }; ENTRIES];
 
-static TSS: Once<TaskStateSegment> = Once::new();
+static TSS: Tss = Tss(UnsafeCell::new(TaskStateSegment {
+    _reserved_1: 0,
+    privilege_stacks: [0; 3],
+    _reserved_2: 0,
+    interrupt_stacks: [0; 7],
+    _reserved_3: 0,
+    _reserved_4: 0,
+    io_map_base: size_of::<TaskStateSegment>() as u16,
+}));
 
-/// Size of each interrupt stack.
+/// The TSS, which the CPU reads on its own (on every interrupt that switches stacks), while
+/// the kernel occasionally changes a stack pointer in it.
+#[repr(transparent)]
+struct Tss(UnsafeCell<TaskStateSegment>);
+
+// SAFETY: there is one TSS for the one CPU in use; its fields are only written by
+// `set_interrupt_stack`, on that CPU. (With SMP every CPU gets its own TSS.)
+unsafe impl Sync for Tss {}
+
+/// Size of the boot-time interrupt stack.
 const IST_STACK_SIZE: usize = 16 * 1024;
 
-/// Stack used by the double fault handler (IST 1).
-static DOUBLE_FAULT_STACK: InterruptStack = InterruptStack(UnsafeCell::new([0; IST_STACK_SIZE]));
+/// Stack used by the double fault handler (IST 1) until the kernel has its own page tables;
+/// then it is replaced by a stack with a guard page (`mm::paging`).
+static BOOT_DOUBLE_FAULT_STACK: InterruptStack =
+    InterruptStack(UnsafeCell::new([0; IST_STACK_SIZE]));
 
 /// Index of the double fault stack in the TSS, as written into an IDT entry (1-based).
 pub const DOUBLE_FAULT_IST: u8 = 1;
@@ -105,16 +123,10 @@ pub struct DescriptorTablePointer {
 
 /// Fills in the GDT and TSS, then loads them into this CPU.
 pub fn init() {
-    let tss = TSS.call_once(|| TaskStateSegment {
-        _reserved_1: 0,
-        privilege_stacks: [0; 3],
-        _reserved_2: 0,
-        interrupt_stacks: [DOUBLE_FAULT_STACK.top(), 0, 0, 0, 0, 0, 0],
-        _reserved_3: 0,
-        _reserved_4: 0,
-        io_map_base: size_of::<TaskStateSegment>() as u16,
-    });
-    let (tss_low, tss_high) = tss_descriptor(tss);
+    // SAFETY: the TSS is not loaded yet, so the CPU does not read it, and nothing else writes
+    // it (`init` runs once, on the boot CPU).
+    unsafe { set_interrupt_stack(DOUBLE_FAULT_IST, BOOT_DOUBLE_FAULT_STACK.top()) };
+    let (tss_low, tss_high) = tss_descriptor();
 
     GDT[usize::from(KERNEL_CODE / 8)].store(KERNEL_CODE_DESCRIPTOR, Ordering::Relaxed);
     GDT[usize::from(KERNEL_DATA / 8)].store(KERNEL_DATA_DESCRIPTOR, Ordering::Relaxed);
@@ -159,10 +171,30 @@ pub fn init() {
     }
 }
 
+/// Points IST entry `ist` (1–7, as in the IDT) at a new stack top.
+///
+/// # Safety
+///
+/// `top` must be the top of a mapped, writable stack that stays valid for as long as the IST
+/// entry points to it and that nothing else uses. Must run on the CPU that owns the TSS.
+pub(crate) unsafe fn set_interrupt_stack(ist: u8, top: u64) {
+    let index = usize::from(ist) - 1;
+    assert!(index < 7, "IST index {ist} out of range 1..=7");
+    // SAFETY: `TSS.0.get()` points to the static TSS, so the field pointer is valid; the TSS is
+    // packed, so its fields may be unaligned, hence a raw pointer and `write_unaligned`
+    // instead of a reference. `index < 7` keeps the write inside `interrupt_stacks`. The TSS
+    // is only written on this CPU, and the CPU reads the entry only when delivering an
+    // exception through this IST entry; the caller vouches for the stack itself.
+    unsafe {
+        let entries = addr_of_mut!((*TSS.0.get()).interrupt_stacks).cast::<u64>();
+        entries.add(index).write_unaligned(top);
+    }
+}
+
 /// Builds the two 64-bit halves of a TSS descriptor ("system segment", 16 bytes long,
 /// because a 64-bit base does not fit into a normal 8-byte descriptor).
-fn tss_descriptor(tss: &'static TaskStateSegment) -> (u64, u64) {
-    let base = tss as *const TaskStateSegment as u64;
+fn tss_descriptor() -> (u64, u64) {
+    let base = TSS.0.get() as u64;
     let limit = (size_of::<TaskStateSegment>() - 1) as u64;
     // 0x89 = present, ring 0, type 9 ("available 64-bit TSS").
     let access: u64 = 0x89;

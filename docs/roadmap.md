@@ -28,9 +28,10 @@ Checklist:
 - [x] `ochra-frame` crate (`frame/`) holds all low-level `unsafe`; `kernel` is
       `#![forbid(unsafe_code)]`
 - [x] PIE kernel with KASLR; SMEP/SMAP/UMIP enabled when CPUID reports them
-- [ ] physical frame allocator (+ debug self-test)
-- [ ] own page tables: W^X, NX, guard pages under every kernel stack (IST and task stacks)
-- [ ] kernel heap with an own simple allocator, no external allocator crate (+ debug self-test)
+- [x] physical frame allocator (+ debug self-test)
+- [x] own page tables: W^X, NX, guard pages under every kernel stack (IST and task stacks);
+      SMEP/SMAP self-test with a user page
+- [x] kernel heap with an own simple allocator, no external allocator crate (+ debug self-test)
 - [ ] interrupts: legacy PIC masked, local APIC (x2APIC, falling back to xAPIC), IRQ-safe locks
 - [ ] LAPIC timer, calibrated
 - [ ] scheduler: kernel tasks with their own stacks, context switch, round-robin on the timer

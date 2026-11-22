@@ -4,6 +4,9 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-22 | Kernel heap: own first-fit free list sorted by address, merging neighbours, 16-byte granularity, in PML4 slot 508, grows on demand; no allocator crate | simple to read and verify; size classes can come later if profiling asks for them |
+| 2026-11-22 | Kernel virtual layout: image in slot 511 (KASLR), direct map at Limine's random offset, heap slot 508, kernel stacks slot 509 in 64 KiB slots (guard page below each); checked at boot | fixed, documented regions; the guard pages cost no memory |
+| 2026-11-22 | Physical frames are owned `Frame` handles (no Copy, freed on drop), as in Asterinas | safe kernel code cannot double-free or use a frame after freeing it |
 | 2026-11-22 | Kernel is a PIE again, `kaslr: yes` in `limine.conf` (Limine also randomises the direct map base); one switch `ochra_frame::SHOW_ADDRESSES` (debug builds) gates every address in the log and crash reports | ends the temporary static build; a single RIP in a breakpoint message or a crash report would reveal the offset just as well as the explicit base |
 | 2026-11-22 | Claude runs `git commit -s` and `git push` at pitstops; each run is approved by the owner in a permission prompt (or explicitly in chat when no prompt appears) and the signature in the SSH agent | the owner's approval of that exact commit is the DCO certification; no `--amend`, force push, `--no-verify` or disabled signing unless asked |
 | 2026-11-22 | Working mode from stage 1: steps without stopping, pitstops with fmt/clippy/test, report, journal and commit | the owner reads code as it lands; stops only for new design decisions, dependencies, unfixable test failures, rules/licences/security |

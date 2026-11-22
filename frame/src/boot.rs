@@ -89,6 +89,13 @@ extern "C" fn kmain() -> ! {
         println!("{RED}the bootloader does not support Limine protocol base revision 3{RESET}");
         halt_forever();
     }
+    match BOOT_INFO.direct_map_offset() {
+        Some(offset) => crate::mm::set_direct_map_offset(offset),
+        None => {
+            println!("{RED}the bootloader did not provide a direct map of physical memory{RESET}");
+            halt_forever();
+        }
+    }
     __ochra_kernel_main(&BOOT_INFO);
 }
 

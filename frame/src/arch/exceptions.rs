@@ -384,22 +384,3 @@ pub fn breakpoint_self_test() {
     // SAFETY: `int3` only raises vector 3, whose handler logs and returns.
     unsafe { asm!("int3", options(nomem, nostack)) };
 }
-
-/// Causes a page fault by writing to an unmapped address (kernel self-test `pagefault`).
-#[cfg(feature = "selftest")]
-pub fn trigger_page_fault() -> ! {
-    // SAFETY: Limine maps nothing in the low 4 GiB for protocol revision 3, so the write
-    // faults instead of changing memory, and the page fault handler never returns.
-    unsafe { core::ptr::write_volatile(0xdead_beef as *mut u8, 42) };
-    unreachable!("the write to 0xdeadbeef did not fault");
-}
-
-/// Causes a double fault the way a kernel stack overflow does (kernel self-test `doublefault`):
-/// with RSP pointing to unmapped memory, the `push` faults, and the CPU cannot push the page
-/// fault frame onto that same stack either. Only the separate IST stack saves the day.
-#[cfg(feature = "selftest")]
-pub fn trigger_double_fault() -> ! {
-    // SAFETY: control never comes back here: the double fault handler halts. The broken
-    // stack pointer is never used by Rust code.
-    unsafe { asm!("mov rsp, 0xdead0000", "push rax", options(noreturn)) };
-}

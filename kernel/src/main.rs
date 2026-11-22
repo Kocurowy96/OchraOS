@@ -12,6 +12,9 @@
 // The point of the framekernel design: a bug in this crate cannot corrupt memory.
 #![forbid(unsafe_code)]
 
+// `Box`, `Vec`, `String`…: the heap part of the standard library, backed by `ochra_frame::mm::heap`.
+extern crate alloc;
+
 mod banner;
 mod logger;
 mod selftest;
@@ -20,6 +23,7 @@ use log::{debug, info, trace};
 use ochra_frame::BootInfo;
 use ochra_frame::arch::{self, exceptions};
 use ochra_frame::boot::MemoryKind;
+use ochra_frame::mm::{FRAME_SIZE, frames, heap, paging};
 
 ochra_frame::entry!(main);
 
@@ -35,6 +39,29 @@ fn main(boot: &'static BootInfo) -> ! {
     let protections = arch::init();
     info!("GDT, TSS and IDT loaded");
     info!("CPU protections: {protections}");
+
+    let memory = frames::init(boot);
+    info!(
+        "physical memory: {} MiB in {} frames managed, {} free",
+        memory.total * FRAME_SIZE / (1024 * 1024),
+        memory.total,
+        memory.free
+    );
+
+    let paging = paging::init(boot);
+    info!(
+        "page tables: {} kernel pages (code r-x, rodata r--, data rw-), {} MiB direct map \
+         ({} huge pages), {} tables; double fault stack has a guard page",
+        paging.kernel_pages,
+        paging.direct_map_bytes / (1024 * 1024),
+        paging.huge_pages,
+        paging.page_tables
+    );
+
+    let heap = heap::init();
+    info!("heap: {} KiB mapped, grows on demand", heap.mapped / 1024);
+
+    selftest::run_checks();
     exceptions::breakpoint_self_test();
 
     // `test=<name>` runs one of the built-in self-tests (see `selftest.rs`).
