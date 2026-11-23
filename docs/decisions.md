@@ -4,6 +4,8 @@ Short record of what was decided and why. Newest first.
 
 | Date | Decision | Why |
 | --- | --- | --- |
+| 2026-11-23 | ABI target Linux 6.12: `uname` reports `Linux`, release `6.12.0-ochra`, version `OchraOS <version>`; unimplemented syscalls return `ENOSYS` | programs check the system name and kernel version; the suffix and the version field still say what runs |
+| 2026-11-23 | Directory reading (`getdents64`), terminal control (termios), Ctrl-C and job control move to stage 3 | they belong with the VFS and a real `/dev`; stage 2 runs scripts and a plain interactive shell |
 | 2026-11-23 | Signals as in Linux: per-process actions, mask and pending set; delivered on every return to user mode through a hook `ochra-frame` calls after syscalls, interrupts and exceptions; handlers get Linux's `rt_sigframe` (registers, `fxsave` state, `siginfo`, `ucontext`) on the user stack and come back through `sa_restorer` and `rt_sigreturn`; a blocked syscall gives up with `ERESTARTSYS`/`ERESTARTNOHAND`, and the return hook restarts it or turns it into `EINTR` (`SA_RESTART`) | the C library and programs depend on this exact ABI; one place decides delivery and restarts |
 | 2026-11-23 | Simplified for now: real-time signals are not queued (one pending per number, like standard ones); stop signals are ignored by default (no job control); no `sigaltstack`; every process may signal every other (no users yet) | enough for busybox `sh`; each comes with the feature that needs it (threads, job control, users) |
 | 2026-11-23 | CPU faults with a blocked or ignored signal still end the process (Linux's `force_sig`); init gets no signal it has no handler for; a parent that ignores `SIGCHLD` (or sets `SA_NOCLDWAIT`) gets no zombies | as Linux |

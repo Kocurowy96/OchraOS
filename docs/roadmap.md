@@ -86,7 +86,10 @@ Checklist:
 
 ## Stage 3 — Files and disks
 
-VFS, tmpfs, ext2 then ext4, EROFS (read-only), AHCI and NVMe, minimal `/proc`, `/sys`, `/dev`.
+VFS, tmpfs, ext2 then ext4, EROFS (read-only), AHCI and NVMe, minimal `/proc`, `/sys`, `/dev`;
+directory reading (`getdents64`); terminal control (termios, line editing, Ctrl-C and other
+signals from the terminal) and job control (sessions, process groups, `setpgid`,
+`tcsetpgrp`), moved here from stage 2.
 
 **Done when:** the system boots from an ext4 partition on a virtual disk.
 

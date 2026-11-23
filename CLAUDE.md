@@ -18,8 +18,8 @@ through this project. So:
 
 ## Current stage
 
-**Stage 2 — Linux ABI.** See `docs/roadmap.md`. (Stage 0 done: CI green on `a97b643`; stage 1
-done: tag `stage-1`; stage 1.5 done: tag `stage-1.5`.)
+**Stage 3 — Files and disks.** See `docs/roadmap.md`. (Stage 0 done: CI green on `a97b643`;
+stage 1 done: tag `stage-1`; stage 1.5 done: tag `stage-1.5`; stage 2 done: tag `stage-2`.)
 Do not start work that belongs to a later stage unless the owner asks for it.
 
 ## Working mode (from stage 1)

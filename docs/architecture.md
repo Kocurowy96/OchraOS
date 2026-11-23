@@ -17,6 +17,25 @@ lightweight and safe, for power users and for less technical people alike.
 - Designed for SMP from the start. SMEP/SMAP, KASLR, W^X.
 - Linux driver compatibility layer (LinuxKPI-style) at stage 8.
 
+### ABI target
+
+The kernel implements the syscall interface of one Linux release, the **ABI target**:
+currently Linux **6.12** (an LTS release). `uname` reports it, so programs and C libraries
+that check the kernel version (glibc refuses kernels older than it was built for) see what
+they may use:
+
+| Field | Value |
+| --- | --- |
+| `sysname` | `Linux` (the interface programs talk to) |
+| `release` | `6.12.0-ochra` (the ABI target, marked as ours by the suffix) |
+| `version` | `OchraOS <kernel version>`, e.g. `OchraOS 0.0.0` (what really runs) |
+| `machine` | `x86_64` |
+
+Syscalls the target has but OchraOS does not implement yet return `ENOSYS`, as Linux does
+for syscalls it lacks; programs fall back where they can. The target moves to a newer
+release only when the kernel implements what that release adds and the programs we care
+about need it.
+
 ## Hardware
 
 | Phase | Platform |

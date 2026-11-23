@@ -11,6 +11,7 @@ mod memory;
 mod paths;
 mod process;
 mod signal;
+mod system;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -57,6 +58,7 @@ mod number {
     pub const EXIT: u64 = 60;
     pub const WAIT4: u64 = 61;
     pub const KILL: u64 = 62;
+    pub const UNAME: u64 = 63;
     pub const FCNTL: u64 = 72;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
@@ -156,6 +158,7 @@ fn dispatch(context: &mut UserContext) {
         number::RT_SIGSUSPEND => signal::rt_sigsuspend(a0, a1),
         number::PAUSE => signal::pause(),
         number::KILL => signal::kill(a0 as i32, a1),
+        number::UNAME => system::uname(a0),
         number::TKILL => signal::tkill(a0 as i32, a1),
         number::TGKILL => signal::tgkill(a0 as i32, a1 as i32, a2),
         _ => {
