@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! /init           userspace/init.sh (the first program the kernel starts: a shell script)
-//! /dev/null       device 1:3, as in Linux; /dev/console, 5:1
+//! /dev, /tmp      empty: mount points for the tmpfs instances the kernel mounts there
 //! /bin/busybox    BusyBox (see `busybox`), with a symbolic link per applet: /bin/sh, /bin/cat…
 //! /bin/<name>     userspace/<name>.c
 //! /tests/<name>   userspace/tests/<name>.c (syscall tests, compared with the host Linux)
@@ -65,10 +65,10 @@ pub fn build() -> Result<(PathBuf, Vec<Program>)> {
 
     let mut archive = Archive::default();
     archive.directory("bin");
+    // Mount points: the kernel mounts a tmpfs on each (and makes the device nodes in /dev).
     archive.directory("dev");
+    archive.directory("tmp");
     archive.directory("tests");
-    archive.character_device("dev/null", 1, 3);
-    archive.character_device("dev/console", 5, 1);
     archive.file(
         "init",
         0o755,

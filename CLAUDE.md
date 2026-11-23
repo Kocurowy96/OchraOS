@@ -103,5 +103,6 @@ The owner's machine is Garuda Linux (Arch-based). OVMF lives in `/usr/share/edk2
 - `docs/architecture.md` — kernel, filesystem layout, init, desktop, components
 - `docs/security.md` — Ochra Guard, USB protection, keys, supply chain
 - `docs/releases.md` — channels, versioning, codenames
+- `docs/vfs.md` — the VFS: inodes, dentries, mounts, page cache, permissions, locking
 - `docs/decisions.md` — log of design decisions
 - `CONTRIBUTING.md` — DCO, AI-assisted contributions, code style

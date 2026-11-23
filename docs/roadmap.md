@@ -93,6 +93,24 @@ signals from the terminal) and job control (sessions, process groups, `setpgid`,
 
 **Done when:** the system boots from an ext4 partition on a virtual disk.
 
+Checklist:
+- [x] P1: VFS with a page cache (which file-backed `mmap` and `ld.so` will use in stage 4);
+      mode, owner and group stored and checked in the VFS; the initramfs unpacked into tmpfs
+      as the root; creating, writing, renaming and removing files and directories,
+      `getdents64`; `/dev` (`null`, `zero`, `full`, `random`, `urandom`, `console`, `tty`);
+      wall clock from the RTC, `CLOCK_MONOTONIC` from the TSC (constant rate checked
+      through CPUID), `clock_gettime`, `gettimeofday`, `nanosleep`
+- [ ] P2: TTY with termios (canonical and raw mode, echo, Ctrl-C/Ctrl-Z/Ctrl-\\), sessions
+      and process groups, stopping and continuing processes, `poll`; ash with line editing
+      and job control; minimal `/proc` and `/sys`
+- [ ] P3: PCI (ACPI MCFG, ECAM), NVMe (polling, then MSI-X), block cache, GPT; AHCI; disk
+      images made by `cargo xtask` without root (`mkfs.ext4 -d`)
+- [ ] P4: ext2 (read and write), then ext4 (extents, 64bit, flex_bg, metadata checksums),
+      writing without the journal (see `docs/decisions.md`); `mount`, `umount2`; the kernel
+      mounts `root=`; boot test from ext4 on a virtual NVMe disk; in CI, after the write
+      test, `e2fsck -fn` on the image and its contents compared through `debugfs`
+- [ ] P5: EROFS (read-only)
+
 ## Stage 4 — Full userspace
 
 Dynamic glibc, `futex`, threads, file-backed `mmap`, `epoll`.

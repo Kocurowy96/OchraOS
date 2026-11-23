@@ -11,7 +11,9 @@ pub mod interrupts;
 pub mod pic;
 mod pit;
 pub(crate) mod port;
+pub mod rtc;
 pub(crate) mod syscall;
+pub mod tsc;
 
 use alloc::boxed::Box;
 use core::arch::asm;

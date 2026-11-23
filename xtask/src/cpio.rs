@@ -12,7 +12,6 @@
 const DIRECTORY: u32 = 0o040_000;
 const REGULAR: u32 = 0o100_000;
 const SYMLINK: u32 = 0o120_000;
-const CHARACTER_DEVICE: u32 = 0o020_000;
 
 /// An archive being built in memory.
 #[derive(Default)]
@@ -38,11 +37,6 @@ impl Archive {
         self.entry(path, SYMLINK | 0o777, target.as_bytes());
     }
 
-    /// Adds a character device node (e.g. `dev/null`, 1:3), readable and writable by all.
-    pub fn character_device(&mut self, path: &str, major: u32, minor: u32) {
-        self.entry_with_device(path, CHARACTER_DEVICE | 0o666, &[], (major, minor));
-    }
-
     /// Ends the archive and returns its bytes.
     pub fn finish(mut self) -> Vec<u8> {
         self.entry("TRAILER!!!", 0, &[]);
@@ -50,11 +44,6 @@ impl Archive {
     }
 
     fn entry(&mut self, path: &str, mode: u32, data: &[u8]) {
-        self.entry_with_device(path, mode, data, (0, 0));
-    }
-
-    /// An entry; `rdev` is the device number of a device node.
-    fn entry_with_device(&mut self, path: &str, mode: u32, data: &[u8], rdev: (u32, u32)) {
         self.entries += 1;
         let fields = [
             self.entries,          // inode number
@@ -66,8 +55,8 @@ impl Archive {
             data.len() as u32,     // file size
             0,                     // device major
             0,                     // device minor
-            rdev.0,                // rdev major
-            rdev.1,                // rdev minor
+            0,                     // rdev major (device nodes are made by the kernel)
+            0,                     // rdev minor
             path.len() as u32 + 1, // name size, with the terminating NUL
             0,                     // checksum (unused in newc)
         ];

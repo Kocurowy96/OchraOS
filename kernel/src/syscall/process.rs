@@ -44,7 +44,7 @@ pub fn execve(
     environment: u64,
 ) -> SyscallResult {
     let path = read_string(path, PATH_MAX - 1).map_err(|error| error.unwrap_or(ENAMETOOLONG))?;
-    // Until the VFS, every path is UTF-8 (the initramfs's are).
+    // Names in the VFS are UTF-8 strings for now, so a path that is not cannot exist.
     let path = String::from_utf8(path).map_err(|_| ENOENT)?;
     let mut total = 0;
     let arguments = read_strings(arguments, &mut total)?;
@@ -136,6 +136,19 @@ pub fn getpid() -> SyscallResult {
 /// `getppid()`: 0 for a process the kernel started (init too, as in Linux).
 pub fn getppid() -> SyscallResult {
     Ok(u64::from(current()?.parent()))
+}
+
+/// `getuid()`, `getgid()`, `geteuid()` and `getegid()`, by syscall number.
+pub fn identity(number: u64) -> SyscallResult {
+    let process = current()?;
+    let credentials = process.credentials.lock();
+    let id = match number {
+        super::number::GETUID => credentials.user,
+        super::number::GETEUID => credentials.effective_user,
+        super::number::GETGID => credentials.group,
+        _ => credentials.effective_group,
+    };
+    Ok(u64::from(id))
 }
 
 /// `getpgrp()`.

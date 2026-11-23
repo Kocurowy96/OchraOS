@@ -20,6 +20,7 @@ mod console;
 mod elf;
 mod errno;
 mod file;
+mod fs;
 mod initramfs;
 mod logger;
 mod memory;
@@ -29,6 +30,7 @@ mod selftest;
 mod signal;
 mod syscall;
 mod time;
+mod vfs;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -84,15 +86,6 @@ fn main(boot: &'static BootInfo) -> ! {
     let heap = heap::init();
     info!("heap: {} KiB mapped, grows on demand", heap.mapped / 1024);
 
-    match boot
-        .initramfs()
-        .map(|archive| (archive.len(), initramfs::init(archive)))
-    {
-        Some((bytes, Some(files))) => info!("initramfs: {files} files, {} KiB", bytes / 1024),
-        Some((_, None)) => log::error!("initramfs: not a valid cpio archive, ignored"),
-        None => log::warn!("initramfs: none loaded"),
-    }
-
     selftest::prepare(command_line);
     smp::init_boot_cpu();
     time::init(smp::cpu_count());
@@ -109,6 +102,12 @@ fn main(boot: &'static BootInfo) -> ! {
         "timer: local APIC timer at {} Hz ({} counts/ms, calibrated with the PIT)",
         timer.hz, timer.counts_per_ms
     );
+    time::init_clocks();
+    // The VFS stamps its files with the time, so it comes after the clocks.
+    if boot.initramfs().is_none() {
+        log::warn!("initramfs: none loaded");
+    }
+    vfs::init(boot.initramfs().unwrap_or(&[]));
     interrupts::enable();
 
     // The other CPUs set up their own local APIC and timer, which needs the boot CPU's done.

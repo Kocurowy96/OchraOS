@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use ochra_frame::arch::interrupts;
 use ochra_frame::mm::user::UserSpace;
-use ochra_frame::sync::IrqMutex;
+use ochra_frame::sync::{IrqMutex, TryMutex, TryMutexGuard};
 use ochra_frame::task::{self, Task};
 
 use crate::errno::{ERESTARTSYS, Errno};
@@ -298,5 +298,61 @@ impl WaitQueue {
         self.waiters
             .lock()
             .retain(|waiter| !Arc::ptr_eq(waiter, task));
+    }
+}
+
+/// A lock for work that may block (disk I/O, waiting for a page): a task that finds it taken
+/// sleeps until it is free, instead of spinning with interrupts off as `IrqMutex` does. Only
+/// for tasks, never in interrupt handlers.
+pub struct Mutex<T> {
+    inner: TryMutex<T>,
+    /// Tasks waiting for the lock; woken when it is released.
+    waiters: WaitQueue,
+}
+
+impl<T> Mutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            inner: TryMutex::new(value),
+            waiters: WaitQueue::new(),
+        }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        let guard = self.waiters.wait_until(|| self.inner.try_lock());
+        MutexGuard {
+            guard: Some(guard),
+            waiters: &self.waiters,
+        }
+    }
+}
+
+/// Access to the data of a locked [`Mutex`]; unlocking (and waking the waiters) happens on
+/// drop.
+pub struct MutexGuard<'a, T> {
+    /// Always `Some` until dropped.
+    guard: Option<TryMutexGuard<'a, T>>,
+    waiters: &'a WaitQueue,
+}
+
+impl<T> core::ops::Deref for MutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.guard.as_ref().expect("held until dropped")
+    }
+}
+
+impl<T> core::ops::DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.guard.as_mut().expect("held until dropped")
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        // Unlock first, then wake: a woken task must find the lock free.
+        self.guard = None;
+        self.waiters.wake_all();
     }
 }

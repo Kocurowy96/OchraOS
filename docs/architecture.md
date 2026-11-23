@@ -40,7 +40,7 @@ about need it.
 
 | Phase | Platform |
 | --- | --- |
-| Start | QEMU/KVM with virtio |
+| Start | QEMU/KVM: NVMe disk first (stage 3); virtio-blk and virtio-net together in stage 5 |
 | First real hardware | ThinkPad T440p |
 | Next | ProDesk 600 G4, ThinkPad T460s |
 | Last | gaming laptop with RTX 4060 |

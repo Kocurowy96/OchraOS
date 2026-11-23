@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! File descriptor syscalls: reading, writing, closing, duplicating, pipes.
+//! File descriptor syscalls: reading, writing, seeking, `fstat`, directory listings,
+//! closing, duplicating, pipes.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -8,7 +9,7 @@ use alloc::vec::Vec;
 use log::debug;
 
 use super::{SyscallResult, current, read_user, write_user};
-use crate::errno::{EFAULT, EINVAL, ENOTTY, EPIPE, Errno};
+use crate::errno::{EBADF, EFAULT, EINVAL, ENOTTY, EPIPE, Errno};
 use crate::file::{self, Descriptor, MAX_DESCRIPTORS, OpenFile, flags};
 use crate::signal::{self, Info, SIGPIPE};
 
@@ -26,7 +27,7 @@ fn open_file(fd: u64) -> Result<alloc::sync::Arc<OpenFile>, Errno> {
             alloc::sync::Arc::new(crate::console::Console),
             0,
         )),
-        Err(_) => Err(crate::errno::EBADF),
+        Err(_) => Err(EBADF),
     }
 }
 
@@ -151,6 +152,71 @@ fn write_vector(fd: u64, vector: u64, count: u64) -> SyscallResult {
     }
     let written = file.file.write(&bytes, file.nonblocking())?;
     Ok(written as u64)
+}
+
+/// `lseek(fd, offset, whence)`.
+pub fn lseek(fd: u64, offset: u64, whence: u64) -> SyscallResult {
+    let file = open_file(fd)?;
+    let whence = u32::try_from(whence).map_err(|_| EINVAL)?;
+    file.file.seek(offset as i64, whence)
+}
+
+/// `pread64(fd, buf, count, offset)`.
+pub fn pread64(fd: u64, buffer: u64, count: u64, offset: u64) -> SyscallResult {
+    if (offset as i64) < 0 {
+        return Err(EINVAL);
+    }
+    let file = open_file(fd)?;
+    let mut bytes = vec![0; (count as usize).min(MAX_TRANSFER)];
+    let read = file.file.read_at(&mut bytes, offset)?;
+    write_user(buffer, &bytes[..read])?;
+    Ok(read as u64)
+}
+
+/// `pwrite64(fd, buf, count, offset)`.
+pub fn pwrite64(fd: u64, buffer: u64, count: u64, offset: u64) -> SyscallResult {
+    if (offset as i64) < 0 {
+        return Err(EINVAL);
+    }
+    let file = open_file(fd)?;
+    let mut bytes = vec![0; (count as usize).min(MAX_TRANSFER)];
+    read_user(&mut bytes, buffer)?;
+    let written = file.file.write_at(&bytes, offset)?;
+    Ok(written as u64)
+}
+
+/// `fstat(fd, statbuf)`.
+pub fn fstat(fd: u64, buffer: u64) -> SyscallResult {
+    let file = open_file(fd)?;
+    write_user(buffer, &file.file.stat().to_stat())?;
+    Ok(0)
+}
+
+/// `ftruncate(fd, length)`: the file must be open for writing.
+pub fn ftruncate(fd: u64, length: u64) -> SyscallResult {
+    if (length as i64) < 0 {
+        return Err(EINVAL);
+    }
+    let file = open_file(fd)?;
+    file.file.truncate(length)?;
+    Ok(0)
+}
+
+/// `fsync(fd)`, `fdatasync(fd)` and `syncfs(fd)`: every filesystem is in memory, so there is
+/// nothing to write back yet; only the descriptor is checked.
+pub fn fsync(fd: u64) -> SyscallResult {
+    open_file(fd)?;
+    Ok(0)
+}
+
+/// `getdents64(fd, dirp, count)`: directory entries as `linux_dirent64` records; 0 at the
+/// end of the directory.
+pub fn getdents64(fd: u64, buffer: u64, count: u64) -> SyscallResult {
+    let file = open_file(fd)?;
+    let size = (count.min(u64::from(u32::MAX))) as usize;
+    let records = file.file.read_directory(size.min(MAX_TRANSFER))?;
+    write_user(buffer, &records)?;
+    Ok(records.len() as u64)
 }
 
 /// `close(fd)`.

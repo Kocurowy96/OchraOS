@@ -18,19 +18,24 @@ pub const EAGAIN: Errno = 11;
 pub const ENOMEM: Errno = 12;
 pub const EACCES: Errno = 13;
 pub const EFAULT: Errno = 14;
+pub const EBUSY: Errno = 16;
 pub const EEXIST: Errno = 17;
+pub const EXDEV: Errno = 18;
 pub const ENOTDIR: Errno = 20;
 pub const EISDIR: Errno = 21;
 pub const EINVAL: Errno = 22;
 pub const EMFILE: Errno = 24;
 pub const ENOTTY: Errno = 25;
+pub const EFBIG: Errno = 27;
+pub const ENOSPC: Errno = 28;
 pub const ESPIPE: Errno = 29;
-pub const EROFS: Errno = 30;
 pub const EPIPE: Errno = 32;
 pub const ERANGE: Errno = 34;
 pub const ENAMETOOLONG: Errno = 36;
 pub const ENOSYS: Errno = 38;
+pub const ENOTEMPTY: Errno = 39;
 pub const ELOOP: Errno = 40;
+pub const EOPNOTSUPP: Errno = 95;
 
 // Kernel-internal codes (`include/linux/errno.h`): a syscall interrupted by a signal returns
 // one of them, and the signal code decides, before going back to the program, whether the

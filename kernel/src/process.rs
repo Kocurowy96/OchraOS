@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! Processes: programs from the initramfs, each in its own address space, as in Linux.
+//! Processes: programs from files, each in its own address space, as in Linux.
 //!
 //! Starting a program ("exec", [`load_program`]):
 //! 0. a file that starts with `#!` is a script: the program to run is the interpreter named
@@ -42,10 +42,10 @@ use ochra_frame::user_mode::UserContext;
 use crate::elf::{self, Elf, Kind};
 use crate::errno::{E2BIG, EACCES, ECHILD, ELOOP, ENOEXEC, ENOMEM, ESRCH, Errno};
 use crate::file::FdTable;
-use crate::initramfs::{self, Node};
 use crate::memory::{self, Memory, page_down, page_up};
 use crate::sched::{self, WaitQueue};
 use crate::signal::{self, SIGCHLD, Signals};
+use crate::vfs::{self, Access, Credentials, Walk, may_access};
 
 pub struct Process {
     pub id: u32,
@@ -56,8 +56,12 @@ pub struct Process {
     group: AtomicU32,
     /// The program's path, for the log.
     name: IrqMutex<String>,
-    /// The current directory, canonical (absolute, no `.`, `..` or links).
-    pub cwd: IrqMutex<String>,
+    /// The current directory.
+    pub cwd: IrqMutex<vfs::Path>,
+    /// Who the process is, for permission checks; everyone is root until there are users.
+    pub credentials: IrqMutex<Credentials>,
+    /// Permission bits taken away from new files (`umask`).
+    pub umask: AtomicU32,
     /// `None` once the process has exited.
     space: IrqMutex<Option<Arc<UserSpace>>>,
     pub memory: IrqMutex<Memory>,
@@ -131,7 +135,9 @@ impl Process {
             parent: AtomicU32::new(parent),
             group: AtomicU32::new(group),
             name: IrqMutex::new(name),
-            cwd: IrqMutex::new(String::from("/")),
+            cwd: IrqMutex::new(vfs::root()),
+            credentials: IrqMutex::new(Credentials::root()),
+            umask: AtomicU32::new(0o022),
             space: IrqMutex::new(Some(space)),
             memory: IrqMutex::new(Memory::new(0)),
             files: IrqMutex::new(FdTable::default()),
@@ -172,9 +178,10 @@ const MAX_INTERPRETERS: usize = 4;
 const SCRIPT_LINE: usize = 256;
 
 /// Loads the program at `path` (relative to `cwd`) with the given arguments and
-/// environment.
+/// environment, as `credentials` may.
 pub fn load_program(
-    cwd: &str,
+    cwd: &vfs::Path,
+    credentials: &Credentials,
     path: &str,
     arguments: &[&[u8]],
     environment: &[&[u8]],
@@ -182,13 +189,10 @@ pub fn load_program(
     let mut arguments: Vec<Vec<u8>> = arguments.iter().map(|text| text.to_vec()).collect();
     let mut file_path = String::from(path);
     for _ in 0..=MAX_INTERPRETERS {
-        let found = initramfs::resolve(cwd, &file_path, true)?;
-        let Node::File(file) = found.node else {
-            return Err(EACCES);
-        };
-        let Some((interpreter, argument)) = script_interpreter(file)? else {
+        let file = read_program(cwd, credentials, &file_path)?;
+        let Some((interpreter, argument)) = script_interpreter(&file)? else {
             let arguments: Vec<&[u8]> = arguments.iter().map(Vec::as_slice).collect();
-            return load_elf(file, path, &arguments, environment);
+            return load_elf(&file, path, &arguments, environment);
         };
         // The interpreter gets: its own name, the optional argument from the `#!` line,
         // the script's path, then the original arguments after the first.
@@ -200,6 +204,25 @@ pub fn load_program(
         file_path = interpreter;
     }
     Err(ELOOP)
+}
+
+/// Reads the whole program file at `path`: a regular file that `credentials` may execute.
+/// Set-user-ID and set-group-ID bits are ignored until there are users (`docs/security.md`).
+fn read_program(cwd: &vfs::Path, credentials: &Credentials, path: &str) -> Result<Vec<u8>, Errno> {
+    let found = cwd.walk(path, Walk::Follow, credentials)?;
+    let metadata = found.metadata();
+    if !metadata.is_regular() {
+        return Err(EACCES);
+    }
+    may_access(&metadata, credentials, Access::EXECUTE)?;
+    let inode = found.inode();
+    let cache = inode.page_cache().ok_or(EACCES)?;
+    let size = usize::try_from(metadata.size).map_err(|_| ENOMEM)?;
+    let mut file = alloc::vec![0; size];
+    let read = cache.read(inode.as_ref(), 0, &mut file, metadata.size)?;
+    file.truncate(read);
+    vfs::touch_accessed(&found);
+    Ok(file)
 }
 
 /// For a script (`#!interpreter [argument]` on its first line): the interpreter and the
@@ -270,7 +293,13 @@ pub fn spawn(
     environment: &[&[u8]],
     files: FdTable,
 ) -> Result<Arc<Process>, Errno> {
-    let image = load_program("/", path, arguments, environment)?;
+    let image = load_program(
+        &vfs::root(),
+        &Credentials::root(),
+        path,
+        arguments,
+        environment,
+    )?;
     let process = Process::new(0, 0, String::from(path), image.space.clone());
     *process.memory.lock() = image.memory;
     *process.files.lock() = files;
@@ -303,6 +332,10 @@ pub fn fork(parent: &Arc<Process>, context: &UserContext) -> Result<u32, Errno> 
     *child.memory.lock() = parent.memory.lock().clone();
     *child.files.lock() = parent.files.lock().clone();
     *child.cwd.lock() = parent.cwd.lock().clone();
+    *child.credentials.lock() = parent.credentials.lock().clone();
+    child
+        .umask
+        .store(parent.umask.load(Ordering::Relaxed), Ordering::Relaxed);
     *child.signals.lock() = parent.signals.lock().for_child();
     let child = Arc::new(child);
     let id = child.id;
@@ -322,7 +355,8 @@ pub fn exec(
     environment: &[&[u8]],
 ) -> Result<(), Errno> {
     let cwd = process.cwd.lock().clone();
-    let image = load_program(&cwd, path, arguments, environment)?;
+    let credentials = process.credentials.lock().clone();
+    let image = load_program(&cwd, &credentials, path, arguments, environment)?;
     // From here on nothing can fail: the old program is gone.
     *process.memory.lock() = image.memory;
     *process.space.lock() = Some(image.space.clone());

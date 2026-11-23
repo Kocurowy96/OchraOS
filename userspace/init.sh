@@ -43,6 +43,17 @@ cat <<EOF
 init: here-document with $((6 * 7))
 EOF
 
+# Files: a redirect into /tmp, directories, a move, a glob (getdents64), removal.
+cd /tmp
+echo ochra > note
+mkdir -p tree/branch
+mv note tree/branch/
+ln -s branch/note tree/link
+echo "init: files $(cat tree/link) $(echo tree/*) $(ls tree/branch)"
+rm -r tree
+echo "init: /tmp holds $(ls -a /tmp | wc -l) entries again"
+cd /
+
 echo "init: checks done"
 while true; do
     echo "init: starting a shell"

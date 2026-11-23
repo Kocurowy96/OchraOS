@@ -8,6 +8,7 @@
 
 mod files;
 mod memory;
+mod names;
 mod paths;
 mod process;
 mod signal;
@@ -42,6 +43,7 @@ mod number {
     pub const RT_SIGRETURN: u64 = 15;
     pub const IOCTL: u64 = 16;
     pub const PREAD64: u64 = 17;
+    pub const PWRITE64: u64 = 18;
     pub const READV: u64 = 19;
     pub const WRITEV: u64 = 20;
     pub const ACCESS: u64 = 21;
@@ -50,6 +52,7 @@ mod number {
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
     pub const PAUSE: u64 = 34;
+    pub const NANOSLEEP: u64 = 35;
     pub const GETPID: u64 = 39;
     pub const CLONE: u64 = 56;
     pub const FORK: u64 = 57;
@@ -60,10 +63,28 @@ mod number {
     pub const KILL: u64 = 62;
     pub const UNAME: u64 = 63;
     pub const FCNTL: u64 = 72;
+    pub const FSYNC: u64 = 74;
+    pub const FDATASYNC: u64 = 75;
+    pub const TRUNCATE: u64 = 76;
+    pub const FTRUNCATE: u64 = 77;
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
     pub const FCHDIR: u64 = 81;
+    pub const RENAME: u64 = 82;
+    pub const MKDIR: u64 = 83;
+    pub const RMDIR: u64 = 84;
+    pub const CREAT: u64 = 85;
+    pub const LINK: u64 = 86;
+    pub const UNLINK: u64 = 87;
+    pub const SYMLINK: u64 = 88;
     pub const READLINK: u64 = 89;
+    pub const CHMOD: u64 = 90;
+    pub const FCHMOD: u64 = 91;
+    pub const CHOWN: u64 = 92;
+    pub const FCHOWN: u64 = 93;
+    pub const LCHOWN: u64 = 94;
+    pub const UMASK: u64 = 95;
+    pub const GETTIMEOFDAY: u64 = 96;
     pub const GETUID: u64 = 102;
     pub const GETGID: u64 = 104;
     pub const GETEUID: u64 = 107;
@@ -72,18 +93,36 @@ mod number {
     pub const GETPGRP: u64 = 111;
     pub const RT_SIGPENDING: u64 = 127;
     pub const RT_SIGSUSPEND: u64 = 130;
+    pub const MKNOD: u64 = 133;
     pub const ARCH_PRCTL: u64 = 158;
+    pub const SYNC: u64 = 162;
     pub const GETTID: u64 = 186;
     pub const TKILL: u64 = 200;
+    pub const TIME: u64 = 201;
+    pub const GETDENTS64: u64 = 217;
     pub const SET_TID_ADDRESS: u64 = 218;
+    pub const CLOCK_GETTIME: u64 = 228;
+    pub const CLOCK_GETRES: u64 = 229;
+    pub const CLOCK_NANOSLEEP: u64 = 230;
     pub const EXIT_GROUP: u64 = 231;
     pub const TGKILL: u64 = 234;
     pub const OPENAT: u64 = 257;
+    pub const MKDIRAT: u64 = 258;
+    pub const MKNODAT: u64 = 259;
+    pub const FCHOWNAT: u64 = 260;
     pub const NEWFSTATAT: u64 = 262;
+    pub const UNLINKAT: u64 = 263;
+    pub const RENAMEAT: u64 = 264;
+    pub const LINKAT: u64 = 265;
+    pub const SYMLINKAT: u64 = 266;
     pub const READLINKAT: u64 = 267;
+    pub const FCHMODAT: u64 = 268;
     pub const FACCESSAT: u64 = 269;
+    pub const UTIMENSAT: u64 = 280;
     pub const DUP3: u64 = 292;
     pub const PIPE2: u64 = 293;
+    pub const SYNCFS: u64 = 306;
+    pub const RENAMEAT2: u64 = 316;
     pub const GETRANDOM: u64 = 318;
     pub const FACCESSAT2: u64 = 439;
 }
@@ -100,7 +139,7 @@ type SyscallResult = Result<u64, Errno>;
 fn dispatch(context: &mut UserContext) {
     let number = context.syscall_number();
     let a = |index| context.argument(index);
-    let (a0, a1, a2, a3, a5) = (a(0), a(1), a(2), a(3), a(5));
+    let (a0, a1, a2, a3, a4, a5) = (a(0), a(1), a(2), a(3), a(4), a(5));
     // A directory descriptor argument is an `int`.
     let dirfd = a0 as i32;
     let result = match number {
@@ -111,10 +150,16 @@ fn dispatch(context: &mut UserContext) {
         number::CLOSE => files::close(a0),
         number::OPEN => paths::open(a0, a1, a2),
         number::OPENAT => paths::openat(dirfd, a1, a2, a3),
-        number::LSEEK => paths::lseek(a0, a1, a2),
-        number::PREAD64 => paths::pread64(a0, a1, a2, a3),
+        number::CREAT => paths::creat(a0, a1),
+        number::LSEEK => files::lseek(a0, a1, a2),
+        number::PREAD64 => files::pread64(a0, a1, a2, a3),
+        number::PWRITE64 => files::pwrite64(a0, a1, a2, a3),
+        number::FSTAT => files::fstat(a0, a1),
+        number::FTRUNCATE => files::ftruncate(a0, a1),
+        number::FSYNC | number::FDATASYNC | number::SYNCFS => files::fsync(a0),
+        number::SYNC => Ok(0),
+        number::GETDENTS64 => files::getdents64(a0, a1, a2),
         number::STAT => paths::stat(a0, a1),
-        number::FSTAT => paths::fstat(a0, a1),
         number::LSTAT => paths::lstat(a0, a1),
         number::NEWFSTATAT => paths::newfstatat(dirfd, a1, a2, a3),
         number::ACCESS => paths::access(a0, a1),
@@ -125,6 +170,30 @@ fn dispatch(context: &mut UserContext) {
         number::FCHDIR => paths::fchdir(a0),
         number::READLINK => paths::readlink(a0, a1, a2),
         number::READLINKAT => paths::readlinkat(dirfd, a1, a2, a3),
+        number::CHMOD => paths::chmod(a0, a1),
+        number::FCHMOD => paths::fchmod(a0, a1),
+        number::FCHMODAT => paths::fchmodat(dirfd, a1, a2),
+        number::CHOWN => paths::chown(a0, a1, a2),
+        number::FCHOWN => paths::fchown(a0, a1, a2),
+        number::LCHOWN => paths::lchown(a0, a1, a2),
+        number::FCHOWNAT => paths::fchownat(dirfd, a1, a2, a3, a4),
+        number::UMASK => paths::umask(a0),
+        number::UTIMENSAT => paths::utimensat(dirfd, a1, a2, a3),
+        number::TRUNCATE => paths::truncate(a0, a1),
+        number::MKDIR => names::mkdir(a0, a1),
+        number::MKDIRAT => names::mkdirat(dirfd, a1, a2),
+        number::RMDIR => names::rmdir(a0),
+        number::UNLINK => names::unlink(a0),
+        number::UNLINKAT => names::unlinkat(dirfd, a1, a2),
+        number::RENAME => names::rename(a0, a1),
+        number::RENAMEAT => names::renameat2(dirfd, a1, a2 as i32, a3, 0),
+        number::RENAMEAT2 => names::renameat2(dirfd, a1, a2 as i32, a3, a4),
+        number::LINK => names::link(a0, a1),
+        number::LINKAT => names::linkat(dirfd, a1, a2 as i32, a3, a4),
+        number::SYMLINK => names::symlink(a0, a1),
+        number::SYMLINKAT => names::symlinkat(a0, a1 as i32, a2),
+        number::MKNOD => names::mknod(a0, a1, a2),
+        number::MKNODAT => names::mknodat(dirfd, a1, a2, a3),
         number::IOCTL => files::ioctl(a0, a1, a2),
         number::PIPE => files::pipe2(a0, 0),
         number::PIPE2 => files::pipe2(a0, a1),
@@ -144,8 +213,9 @@ fn dispatch(context: &mut UserContext) {
         number::GETPID => process::getpid(),
         number::GETTID => process::getpid(),
         number::GETPPID => process::getppid(),
-        // Everyone is root until there are users.
-        number::GETUID | number::GETGID | number::GETEUID | number::GETEGID => Ok(0),
+        number::GETUID | number::GETGID | number::GETEUID | number::GETEGID => {
+            process::identity(number)
+        }
         number::GETPGRP => process::getpgrp(),
         number::SCHED_YIELD => process::sched_yield(),
         number::ARCH_PRCTL => process::arch_prctl(a0, a1),
@@ -159,6 +229,12 @@ fn dispatch(context: &mut UserContext) {
         number::PAUSE => signal::pause(),
         number::KILL => signal::kill(a0 as i32, a1),
         number::UNAME => system::uname(a0),
+        number::CLOCK_GETTIME => system::clock_gettime(a0, a1),
+        number::CLOCK_GETRES => system::clock_getres(a0, a1),
+        number::CLOCK_NANOSLEEP => system::clock_nanosleep(a0, a1, a2, a3),
+        number::NANOSLEEP => system::nanosleep(a0, a1),
+        number::GETTIMEOFDAY => system::gettimeofday(a0, a1),
+        number::TIME => system::time(a0),
         number::TKILL => signal::tkill(a0 as i32, a1),
         number::TGKILL => signal::tgkill(a0 as i32, a1 as i32, a2),
         _ => {

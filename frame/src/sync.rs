@@ -84,3 +84,26 @@ impl<T> Drop for IrqMutexGuard<'_, T> {
         }
     }
 }
+
+/// A lock that is only ever tried, never waited for: the building block of locks that put a
+/// waiting task to sleep (the kernel's `sched::Mutex`). It leaves interrupts alone, so its
+/// holder may block or be switched out; it must never be taken in an interrupt handler.
+pub struct TryMutex<T> {
+    inner: spin::Mutex<T>,
+}
+
+/// Access to the data of a locked [`TryMutex`]; unlocking happens on drop.
+pub type TryMutexGuard<'a, T> = spin::MutexGuard<'a, T>;
+
+impl<T> TryMutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            inner: spin::Mutex::new(value),
+        }
+    }
+
+    /// Takes the lock if it is free right now; otherwise returns `None` at once.
+    pub fn try_lock(&self) -> Option<TryMutexGuard<'_, T>> {
+        self.inner.try_lock()
+    }
+}

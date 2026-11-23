@@ -330,9 +330,13 @@ fn check_heap() {
     }
     let after = heap::stats();
     assert_eq!(after.used, before.used, "self-test heap: memory leaked");
-    assert_eq!(
-        after.free_blocks, 1,
-        "self-test heap: free blocks not merged"
+    // What the test freed merged back: no more free blocks than before it (the VFS and the
+    // rest of the boot allocated before, so there may be holes it did not make).
+    assert!(
+        after.free_blocks <= before.free_blocks,
+        "self-test heap: free blocks not merged ({} before, {} after)",
+        before.free_blocks,
+        after.free_blocks
     );
 
     log::info!(

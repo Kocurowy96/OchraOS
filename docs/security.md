@@ -24,6 +24,19 @@ Security is priority number one.
   program may set itself are restored (interrupts stay on, I/O privilege stays 0), the
   selectors never come from the frame, unsupported MXCSR bits are cleared before `fxrstor`,
   and an instruction pointer in the kernel half becomes the program's own fault.
+- **setuid and setgid:** `execve` ignores these bits until there are real users; every
+  process runs as root, so they could only hide where privileges come from.
+- **One access decision:** every file access is decided in one VFS function (`may_access`,
+  see `docs/vfs.md`), with a hook for Ochra Guard that can only refuse, as Linux security
+  modules do.
+- **Writing to disks:** until ext4 journalling exists, OchraOS writes only to virtual disks
+  (tests); a real disk is never written. A filesystem with unknown features is mounted
+  read-only, and one mounted for writing is marked "not clean" until it is unmounted
+  cleanly.
+- **DMA without an IOMMU (known limitation):** devices (NVMe, AHCI, later network and GPU)
+  can read and write any physical memory, since VT-d / AMD-Vi is not used yet. A malicious
+  or broken device, or a Thunderbolt/PCIe device plugged in, is not contained. Planned:
+  IOMMU page tables per device before untrusted external devices are supported.
 - **Meltdown:** user page tables map the kernel half (supervisor-only) for now. Before
   OchraOS runs on a CPU affected by Meltdown (e.g. Haswell, as in the ThinkPad T440p), the
   kernel needs KPTI (separate user page tables without the kernel), switched off when

@@ -15,8 +15,9 @@ use ochra_frame::sync::IrqMutex;
 use ochra_frame::{print, serial};
 
 use crate::errno::{EAGAIN, Errno};
-use crate::file::{File, Stat, device, flags, mode};
+use crate::file::{File, anonymous_metadata, device, flags};
 use crate::sched::WaitQueue;
+use crate::vfs::{Metadata, mode};
 
 struct Input {
     /// The line being typed.
@@ -133,13 +134,9 @@ impl File for Console {
         flags::O_RDWR
     }
 
-    fn stat(&self) -> Stat {
+    fn stat(&self) -> Metadata {
         // As Linux's `/dev/console`: character device 5:1.
-        Stat {
-            mode: mode::CHARACTER_DEVICE | 0o600,
-            rdev: device(5, 1),
-            ..Stat::default()
-        }
+        anonymous_metadata(mode::CHARACTER_DEVICE | 0o600, device(5, 1), 0, 0)
     }
 
     fn is_terminal(&self) -> bool {

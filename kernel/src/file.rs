@@ -18,15 +18,16 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use ochra_frame::sync::IrqMutex;
 
-use crate::errno::{EAGAIN, EBADF, EINVAL, EISDIR, EMFILE, ENXIO, EPIPE, ESPIPE, Errno};
-use crate::initramfs::{Found, Node};
+use crate::errno::{EAGAIN, EBADF, EINVAL, EMFILE, ENOSPC, ENOTDIR, ENXIO, EPIPE, ESPIPE, Errno};
 use crate::sched::WaitQueue;
+use crate::vfs::{Credentials, Metadata, NewNode, Path, Timestamp, mode};
 
 /// Open flags (`include/uapi/asm-generic/fcntl.h`), in octal as there.
 pub mod flags {
     pub const O_RDONLY: u32 = 0;
     pub const O_WRONLY: u32 = 1;
     pub const O_RDWR: u32 = 2;
+    pub const O_APPEND: u32 = 0o2000;
     pub const O_NONBLOCK: u32 = 0o4000;
     pub const O_CLOEXEC: u32 = 0o2_000_000;
 }
@@ -51,8 +52,19 @@ pub trait File: Send + Sync {
         false
     }
 
+    /// Whether writes go to the end of the file (`O_APPEND`).
+    fn append(&self) -> bool {
+        false
+    }
+
     /// What `fstat` reports.
-    fn stat(&self) -> Stat;
+    fn stat(&self) -> Metadata;
+
+    /// Where the file is in the tree, if it was opened through a path (for `fchmod`,
+    /// `fchown`, `futimens`, `fchdir`).
+    fn path(&self) -> Option<Path> {
+        None
+    }
 
     /// Moves the file position (`lseek`); files without one (pipes, terminals) refuse.
     fn seek(&self, _offset: i64, _whence: u32) -> Result<u64, Errno> {
@@ -64,72 +76,84 @@ pub trait File: Send + Sync {
         Err(ESPIPE)
     }
 
-    /// For a directory: its canonical path (`openat` relative to it, `fchdir`).
-    fn directory(&self) -> Option<&str> {
+    /// Writes at `offset` without moving the file position (`pwrite64`).
+    fn write_at(&self, _data: &[u8], _offset: u64) -> Result<usize, Errno> {
+        Err(ESPIPE)
+    }
+
+    /// For a directory: where it is (`openat` relative to it, `fchdir`).
+    fn directory(&self) -> Option<Path> {
         None
+    }
+
+    /// For a directory: `linux_dirent64` records that fit in `size` bytes (`getdents64`).
+    fn read_directory(&self, _size: usize) -> Result<Vec<u8>, Errno> {
+        Err(ENOTDIR)
+    }
+
+    /// Sets the size of a regular file opened for writing (`ftruncate`).
+    fn truncate(&self, _size: u64) -> Result<(), Errno> {
+        Err(EINVAL)
     }
 }
 
-/// What `stat` reports about a file (`struct stat`, the fields that mean something here).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Stat {
-    /// Type and permission bits.
-    pub mode: u32,
-    pub inode: u64,
-    pub size: u64,
-    /// The filesystem's device number.
-    pub device: u64,
-    /// For a device file, the device's number.
-    pub rdev: u64,
+/// The metadata of a file that is not in any filesystem (a pipe, the console before
+/// `/dev` existed): only what is given, the rest zero.
+pub fn anonymous_metadata(mode: u32, rdev: u64, device: u64, inode: u64) -> Metadata {
+    Metadata {
+        inode,
+        device,
+        mode,
+        links: 1,
+        rdev,
+        ..Metadata::default()
+    }
 }
 
-/// The device a character device node stands for, by major and minor number (Linux's
-/// numbers, `Documentation/admin-guide/devices.txt`); `ENXIO` for one that does not exist.
-pub fn open_device(major: u32, minor: u32) -> Result<Arc<dyn File>, Errno> {
-    match (major, minor) {
+/// The device a character device node stands for, by its number (Linux's numbers,
+/// `Documentation/admin-guide/devices.txt`); `ENXIO` for one that does not exist.
+pub fn open_device(rdev: u64) -> Result<Arc<dyn File>, Errno> {
+    match (rdev >> 8, rdev & 0xff) {
         (1, 3) => Ok(Arc::new(Null)),
-        (5, 1) => Ok(Arc::new(crate::console::Console)),
+        (1, 5) => Ok(Arc::new(Zero { full: false })),
+        (1, 7) => Ok(Arc::new(Zero { full: true })),
+        (1, 8 | 9) => Ok(Arc::new(Random)),
+        // `/dev/tty` is the process's controlling terminal: the console, the only one.
+        (5, 0 | 1) => Ok(Arc::new(crate::console::Console)),
         _ => Err(ENXIO),
     }
 }
 
-/// File types for [`Stat::mode`] that are not in the initramfs.
-pub mod mode {
-    pub const FIFO: u32 = 0o010_000;
-    pub const CHARACTER_DEVICE: u32 = 0o020_000;
+/// Creates the device nodes in the directory `dev`, with Linux's numbers and permissions.
+pub fn create_device_nodes(dev: &Path) {
+    let credentials = Credentials::root();
+    let nodes = [
+        ("null", device(1, 3), 0o666),
+        ("zero", device(1, 5), 0o666),
+        ("full", device(1, 7), 0o666),
+        ("random", device(1, 8), 0o666),
+        ("urandom", device(1, 9), 0o666),
+        ("tty", device(5, 0), 0o666),
+        ("console", device(5, 1), 0o600),
+    ];
+    for (name, rdev, permissions) in nodes {
+        if let Err(error) = dev.create(
+            name,
+            NewNode::CharacterDevice(rdev),
+            permissions,
+            &credentials,
+        ) {
+            log::error!("cannot create /dev/{name} (errno {error})");
+        }
+    }
 }
 
-/// Device numbers (`st_dev`) of the filesystems: the initramfs, and the internal one of
-/// pipes. Linux numbers them similarly (0:1 is its rootfs).
-pub const INITRAMFS_DEVICE: u64 = 1;
+/// The device number (`st_dev`) of the internal filesystem of pipes, as Linux's pipefs.
 pub const PIPE_DEVICE: u64 = 0x0d;
 
 /// A device number from its major and minor numbers (`makedev`, small numbers only).
 pub const fn device(major: u64, minor: u64) -> u64 {
     major << 8 | minor
-}
-
-impl Stat {
-    /// `struct stat` on x86-64: 144 bytes.
-    pub fn to_bytes(self) -> [u8; 144] {
-        /// The block size `st_blksize` suggests for I/O.
-        const BLOCK: u64 = 4096;
-        let mut bytes = [0; 144];
-        let mut put = |offset: usize, value: u64| {
-            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        };
-        put(0, self.device);
-        put(8, self.inode);
-        put(16, 1); // st_nlink
-        put(40, self.rdev);
-        put(48, self.size);
-        put(56, BLOCK);
-        put(64, self.size.div_ceil(512)); // st_blocks, in 512-byte units
-        // Times stay 0 (1970): the initramfs has none, and there is no clock yet.
-        bytes[24..28].copy_from_slice(&self.mode.to_le_bytes());
-        // st_uid and st_gid stay 0: root.
-        bytes
-    }
 }
 
 /// One opening of a file.
@@ -153,10 +177,16 @@ impl OpenFile {
 
     /// `fcntl(F_GETFL)`: access mode and status flags.
     pub fn status_flags(&self) -> u32 {
-        self.file.access_mode() | self.status.load(Ordering::Relaxed)
+        let append = if self.file.append() {
+            flags::O_APPEND
+        } else {
+            0
+        };
+        self.file.access_mode() | append | self.status.load(Ordering::Relaxed)
     }
 
     /// `fcntl(F_SETFL)`: other bits are ignored, as Linux ignores the ones it cannot change.
+    /// `O_APPEND` too, for now: it is fixed when the file is opened.
     pub fn set_status_flags(&self, value: u32) {
         self.status
             .store(value & flags::O_NONBLOCK, Ordering::Relaxed);
@@ -253,13 +283,8 @@ impl FdTable {
 pub struct Null;
 
 impl File for Null {
-    fn stat(&self) -> Stat {
-        // As `/dev/null`: character device 1:3.
-        Stat {
-            mode: mode::CHARACTER_DEVICE | 0o666,
-            rdev: device(1, 3),
-            ..Stat::default()
-        }
+    fn stat(&self) -> Metadata {
+        anonymous_metadata(mode::CHARACTER_DEVICE | 0o666, device(1, 3), 0, 0)
     }
 
     fn read(&self, _buffer: &mut [u8], _nonblocking: bool) -> Result<usize, Errno> {
@@ -268,6 +293,71 @@ impl File for Null {
 
     fn write(&self, data: &[u8], _nonblocking: bool) -> Result<usize, Errno> {
         Ok(data.len())
+    }
+
+    /// Any position is fine and stays 0, as Linux's `/dev/null`.
+    fn seek(&self, _offset: i64, _whence: u32) -> Result<u64, Errno> {
+        Ok(0)
+    }
+
+    fn access_mode(&self) -> u32 {
+        flags::O_RDWR
+    }
+}
+
+/// `/dev/zero` reads zeros and swallows writes; `/dev/full` reads zeros and is always full.
+struct Zero {
+    full: bool,
+}
+
+impl File for Zero {
+    fn stat(&self) -> Metadata {
+        let minor = if self.full { 7 } else { 5 };
+        anonymous_metadata(mode::CHARACTER_DEVICE | 0o666, device(1, minor), 0, 0)
+    }
+
+    fn read(&self, buffer: &mut [u8], _nonblocking: bool) -> Result<usize, Errno> {
+        buffer.fill(0);
+        Ok(buffer.len())
+    }
+
+    fn write(&self, data: &[u8], _nonblocking: bool) -> Result<usize, Errno> {
+        if self.full && !data.is_empty() {
+            return Err(ENOSPC);
+        }
+        Ok(data.len())
+    }
+
+    fn seek(&self, _offset: i64, _whence: u32) -> Result<u64, Errno> {
+        Ok(0)
+    }
+
+    fn access_mode(&self) -> u32 {
+        flags::O_RDWR
+    }
+}
+
+/// `/dev/random` and `/dev/urandom`: the kernel's random generator, as `getrandom` (since
+/// Linux 5.6 both never block once the generator is seeded). Writes are taken and ignored:
+/// Linux mixes them in without crediting entropy.
+struct Random;
+
+impl File for Random {
+    fn stat(&self) -> Metadata {
+        anonymous_metadata(mode::CHARACTER_DEVICE | 0o666, device(1, 9), 0, 0)
+    }
+
+    fn read(&self, buffer: &mut [u8], _nonblocking: bool) -> Result<usize, Errno> {
+        ochra_frame::random::fill(buffer);
+        Ok(buffer.len())
+    }
+
+    fn write(&self, data: &[u8], _nonblocking: bool) -> Result<usize, Errno> {
+        Ok(data.len())
+    }
+
+    fn seek(&self, _offset: i64, _whence: u32) -> Result<u64, Errno> {
+        Ok(0)
     }
 
     fn access_mode(&self) -> u32 {
@@ -287,6 +377,7 @@ struct Pipe {
     readable: WaitQueue,
     /// Writers wait here for room (or for the last reader to go).
     writable: WaitQueue,
+    created: Timestamp,
 }
 
 struct PipeState {
@@ -311,6 +402,7 @@ pub fn pipe() -> (Arc<dyn File>, Arc<dyn File>) {
         }),
         readable: WaitQueue::new(),
         writable: WaitQueue::new(),
+        created: Timestamp::now(),
     });
     let reader = Arc::new(PipeEnd {
         pipe: pipe.clone(),
@@ -403,15 +495,14 @@ impl File for PipeEnd {
         }
     }
 
-    fn stat(&self) -> Stat {
-        Stat {
-            mode: mode::FIFO | 0o600,
-            // One number per pipe, as Linux's pipefs gives each its own inode.
-            inode: Arc::as_ptr(&self.pipe) as u64,
-            size: 0,
-            device: PIPE_DEVICE,
-            rdev: 0,
-        }
+    fn stat(&self) -> Metadata {
+        // One number per pipe, as Linux's pipefs gives each its own inode.
+        let inode = Arc::as_ptr(&self.pipe) as u64;
+        let mut metadata = anonymous_metadata(mode::FIFO | 0o600, 0, PIPE_DEVICE, inode);
+        metadata.accessed = self.pipe.created;
+        metadata.modified = self.pipe.created;
+        metadata.changed = self.pipe.created;
+        metadata
     }
 }
 
@@ -428,97 +519,5 @@ impl Drop for PipeEnd {
         // Readers now see the end of file, or writers `EPIPE`.
         self.pipe.readable.wake_all();
         self.pipe.writable.wake_all();
-    }
-}
-
-/// A file or directory of the initramfs, opened read-only. Each `open` makes a new one, with
-/// its own position; `dup` and `fork` share it (through the `OpenFile`).
-pub struct InitramfsFile {
-    found: Found,
-    position: IrqMutex<u64>,
-}
-
-impl InitramfsFile {
-    pub fn new(found: Found) -> Self {
-        Self {
-            found,
-            position: IrqMutex::new(0),
-        }
-    }
-
-    fn data(&self) -> Result<&'static [u8], Errno> {
-        match self.found.node {
-            Node::File(data) => Ok(data),
-            _ => Err(EISDIR),
-        }
-    }
-}
-
-/// The `stat` of something found in the initramfs.
-pub fn initramfs_stat(found: &Found) -> Stat {
-    let (size, rdev) = match found.node {
-        Node::File(data) => (data.len(), 0),
-        Node::Symlink(target) => (target.len(), 0),
-        Node::Directory => (0, 0),
-        Node::CharacterDevice(major, minor) => (0, device(major.into(), minor.into())),
-    };
-    Stat {
-        mode: found.mode,
-        inode: found.inode,
-        size: size as u64,
-        device: INITRAMFS_DEVICE,
-        rdev,
-    }
-}
-
-impl File for InitramfsFile {
-    fn read(&self, buffer: &mut [u8], _nonblocking: bool) -> Result<usize, Errno> {
-        let mut position = self.position.lock();
-        let count = self.read_at(buffer, *position)?;
-        *position += count as u64;
-        Ok(count)
-    }
-
-    fn read_at(&self, buffer: &mut [u8], offset: u64) -> Result<usize, Errno> {
-        let data = self.data()?;
-        let start = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(data.len());
-        let count = buffer.len().min(data.len() - start);
-        buffer[..count].copy_from_slice(&data[start..start + count]);
-        Ok(count)
-    }
-
-    fn access_mode(&self) -> u32 {
-        flags::O_RDONLY
-    }
-
-    fn stat(&self) -> Stat {
-        initramfs_stat(&self.found)
-    }
-
-    /// `whence`: `SEEK_SET` (0), `SEEK_CUR` (1) or `SEEK_END` (2). The position may go past
-    /// the end (reads there give nothing), not below 0.
-    fn seek(&self, offset: i64, whence: u32) -> Result<u64, Errno> {
-        const SEEK_SET: u32 = 0;
-        const SEEK_CUR: u32 = 1;
-        const SEEK_END: u32 = 2;
-        let mut position = self.position.lock();
-        let base = match whence {
-            SEEK_SET => 0,
-            SEEK_CUR => *position,
-            SEEK_END => self.stat().size,
-            _ => return Err(EINVAL),
-        };
-        let new = base
-            .checked_add_signed(offset)
-            .filter(|&new| new <= i64::MAX as u64)
-            .ok_or(EINVAL)?;
-        *position = new;
-        Ok(new)
-    }
-
-    fn directory(&self) -> Option<&str> {
-        matches!(self.found.node, Node::Directory).then_some(self.found.path.as_str())
     }
 }

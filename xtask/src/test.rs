@@ -77,6 +77,8 @@ const CASES: &[Case] = &[
             "init: trap ran for USR1",
             "init: ochra ochra ochra from yes",
             "init: here-document with 42",
+            "init: files ochra tree/branch tree/link note",
+            "init: /tmp holds 2 entries again",
             "init: checks done",
             "init: starting a shell",
             "shell got 42",

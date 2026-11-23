@@ -1,172 +1,102 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 //! The initramfs: a cpio archive ("newc" format, as in Linux) that Limine loads next to the
-//! kernel. Until there is a VFS (stage 3) it is the only filesystem, read-only. It holds
-//! regular files, directories, symbolic links (whose data is the target path) and character
-//! device nodes (`/dev/null`…); a directory also exists implicitly when some entry lies
-//! inside it.
+//! kernel. At boot it is unpacked into the root tmpfs (`vfs::init`), as Linux does with its
+//! initramfs. It holds regular files, directories, symbolic links (whose data is the target
+//! path) and character device nodes; the parent directories of an entry are created when
+//! the archive does not list them.
 //!
 //! An archive is a list of entries: a 110-byte ASCII header (magic `070701` and 13 fields of
 //! 8 hexadecimal digits), the path, then the data, each padded to 4 bytes. The entry
 //! `TRAILER!!!` ends it. `cargo xtask build` writes it (`xtask/src/cpio.rs`).
 
 use alloc::string::String;
-use alloc::vec::Vec;
 
 use ochra_frame::sync::IrqMutex;
 
-use crate::errno::{ELOOP, ENAMETOOLONG, ENOENT, ENOTDIR, Errno};
+use crate::errno::{EEXIST, EINVAL, Errno};
+use crate::file::device;
+use crate::vfs::{Credentials, NewNode, Path, Walk, mode};
 
-/// The archive's bytes, set once at boot.
+/// The archive's bytes, kept for the self-tests (which list its programs).
 static ARCHIVE: IrqMutex<&'static [u8]> = IrqMutex::new(&[]);
 
-/// Remembers the archive. Returns how many files it holds, or `None` if it is malformed
-/// (then it is not used at all).
-pub fn init(archive: &'static [u8]) -> Option<usize> {
-    let files = Entries { rest: archive }
-        .map(|entry| entry.map(|entry| entry.is_file()))
-        .try_fold(0, |count, is_file| {
-            is_file.map(|is_file| count + usize::from(is_file))
-        })?;
+/// Unpacks `archive` into the directory `root`; returns how many entries it held. Stops at
+/// the first malformed entry (`EINVAL`), keeping what was unpacked before it.
+pub fn unpack(archive: &'static [u8], root: &Path) -> Result<usize, Errno> {
     *ARCHIVE.lock() = archive;
-    Some(files)
-}
-
-/// What a path names.
-#[derive(Clone, Copy, Debug)]
-pub enum Node {
-    File(&'static [u8]),
-    Directory,
-    Symlink(&'static str),
-    /// A character device, by major and minor number.
-    CharacterDevice(u32, u32),
-}
-
-/// A path found in the archive: its canonical form (absolute, no `.`, `..` or links),
-/// what it is, its mode (`st_mode`: type and permissions) and an inode number (the entry's
-/// position; 1 for the root and for directories that only exist implicitly).
-#[derive(Clone, Debug)]
-pub struct Found {
-    pub path: String,
-    pub node: Node,
-    pub mode: u32,
-    pub inode: u64,
-}
-
-/// Most symbolic links followed for one path, as Linux (`MAXSYMLINKS`).
-const MAX_LINKS: usize = 40;
-/// Longest path, with its NUL (Linux's `PATH_MAX`).
-pub const PATH_MAX: usize = 4096;
-
-/// Looks up `path`, relative to the directory `cwd` (canonical) unless it is absolute,
-/// following symbolic links on the way, and in the last component too if `follow_last`.
-pub fn resolve(cwd: &str, path: &str, follow_last: bool) -> Result<Found, Errno> {
-    if path.is_empty() {
-        return Err(ENOENT);
-    }
-    if path.len() >= PATH_MAX {
-        return Err(ENAMETOOLONG);
-    }
-    // Components still to walk, last first, and the canonical directory reached so far.
-    let mut pending: Vec<String> = Vec::new();
-    push_components(&mut pending, path);
-    let mut current: Vec<String> = if path.starts_with('/') {
-        Vec::new()
-    } else {
-        cwd.split('/')
-            .filter(|part| !part.is_empty())
-            .map(String::from)
-            .collect()
-    };
-    let mut links = 0;
-    let mut found = root();
-    while let Some(component) = pending.pop() {
-        if !matches!(found.node, Node::Directory) {
-            return Err(ENOTDIR);
-        }
-        match component.as_str() {
-            "." => continue,
-            ".." => {
-                current.pop();
-                found = lookup_canonical(&current).ok_or(ENOENT)?;
-                continue;
-            }
-            _ => {}
-        }
-        current.push(component);
-        let next = lookup_canonical(&current).ok_or(ENOENT)?;
-        let last = pending.is_empty();
-        if let Node::Symlink(target) = next.node
-            && (!last || follow_last)
-        {
-            links += 1;
-            if links > MAX_LINKS {
-                return Err(ELOOP);
-            }
-            current.pop();
-            push_components(&mut pending, target);
-            if target.starts_with('/') {
-                current.clear();
-            }
-            found = lookup_canonical(&current).ok_or(ENOENT)?;
+    let credentials = Credentials::root();
+    let mut count = 0;
+    for entry in (Entries { rest: archive }) {
+        let entry = entry.ok_or(EINVAL)?;
+        let name = entry.name.trim_start_matches('/');
+        if name.is_empty() || name == "." {
             continue;
         }
-        found = next;
-    }
-    Ok(found)
-}
-
-/// Adds the components of `path` to `pending` so that its first one is popped next.
-fn push_components(pending: &mut Vec<String>, path: &str) {
-    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    pending.extend(parts.into_iter().rev().map(String::from));
-}
-
-/// The mode of the root and of implicit directories: `drwxr-xr-x`.
-const IMPLICIT_DIRECTORY: u32 = DIRECTORY | 0o755;
-
-fn root() -> Found {
-    Found {
-        path: String::from("/"),
-        node: Node::Directory,
-        mode: IMPLICIT_DIRECTORY,
-        inode: 1,
-    }
-}
-
-/// The entry at the canonical path made of `components` (no links followed).
-fn lookup_canonical(components: &[String]) -> Option<Found> {
-    if components.is_empty() {
-        return Some(root());
-    }
-    let relative = components.join("/");
-    let path = alloc::format!("/{relative}");
-    let archive = *ARCHIVE.lock();
-    let mut implicit = false;
-    for (index, entry) in (Entries { rest: archive })
-        .map_while(|entry| entry)
-        .enumerate()
-    {
-        if entry.name == relative {
-            let node = entry.node()?;
-            return Some(Found {
-                path,
-                node,
-                mode: entry.mode,
-                inode: index as u64 + 2,
-            });
+        let (parent, base) = match name.rsplit_once('/') {
+            Some((parent, base)) => (make_directories(root, parent, &credentials)?, base),
+            None => (root.clone(), name),
+        };
+        let permissions = entry.mode & mode::CHANGEABLE;
+        let node = match entry.mode & mode::TYPE {
+            mode::REGULAR => NewNode::Regular,
+            mode::DIRECTORY => NewNode::Directory,
+            mode::SYMLINK => {
+                let target = core::str::from_utf8(entry.data).map_err(|_| EINVAL)?;
+                NewNode::Symlink(String::from(target))
+            }
+            mode::CHARACTER_DEVICE => {
+                NewNode::CharacterDevice(device(entry.rdev.0.into(), entry.rdev.1.into()))
+            }
+            // Other kinds (FIFOs, sockets, block devices) are not in OchraOS's archives.
+            _ => return Err(EINVAL),
+        };
+        let is_directory = matches!(node, NewNode::Directory);
+        let created = match parent.create(base, node, permissions, &credentials) {
+            Ok(created) => created,
+            // A directory created earlier for an entry inside it: give it its own mode.
+            Err(EEXIST) if is_directory => {
+                let existing = parent.walk(base, Walk::NoFollow, &credentials)?;
+                existing.inode().set_metadata(&mut |metadata| {
+                    metadata.mode = (metadata.mode & mode::TYPE) | permissions;
+                })?;
+                count += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if entry.mode & mode::TYPE == mode::REGULAR {
+            write_contents(&created, entry.data)?;
         }
-        implicit |= entry
-            .name
-            .strip_prefix(relative.as_str())
-            .is_some_and(|rest| rest.starts_with('/'));
+        count += 1;
     }
-    implicit.then_some(Found {
-        path,
-        node: Node::Directory,
-        mode: IMPLICIT_DIRECTORY,
-        inode: 1,
-    })
+    Ok(count)
+}
+
+/// `mkdir -p`: the directory `path` under `root`, created (mode 755) where missing.
+fn make_directories(root: &Path, path: &str, credentials: &Credentials) -> Result<Path, Errno> {
+    let mut current = root.clone();
+    for name in path.split('/').filter(|name| !name.is_empty()) {
+        current = match current.walk(name, Walk::Follow, credentials) {
+            Ok(found) => found,
+            Err(crate::errno::ENOENT) => {
+                current.create(name, NewNode::Directory, 0o755, credentials)?
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(current)
+}
+
+/// Writes a file's contents through its page cache.
+fn write_contents(file: &Path, data: &[u8]) -> Result<(), Errno> {
+    let inode = file.inode();
+    let cache = inode.page_cache().ok_or(EINVAL)?;
+    let written = cache.write(inode.as_ref(), 0, data)?;
+    if written < data.len() {
+        return Err(crate::errno::ENOSPC);
+    }
+    inode.set_metadata(&mut |metadata| metadata.size = data.len() as u64)
 }
 
 /// Every regular file: its path without the leading `/`, and its contents.
@@ -190,27 +120,9 @@ struct Entry {
     data: &'static [u8],
 }
 
-/// File type bits of the mode (`st_mode`).
-const TYPE_MASK: u32 = 0o170_000;
-const REGULAR: u32 = 0o100_000;
-const DIRECTORY: u32 = 0o040_000;
-const SYMLINK: u32 = 0o120_000;
-const CHARACTER_DEVICE: u32 = 0o020_000;
-
 impl Entry {
     fn is_file(&self) -> bool {
-        self.mode & TYPE_MASK == REGULAR
-    }
-
-    /// What the entry is; `None` for kinds the initramfs does not support (devices…).
-    fn node(&self) -> Option<Node> {
-        match self.mode & TYPE_MASK {
-            REGULAR => Some(Node::File(self.data)),
-            DIRECTORY => Some(Node::Directory),
-            SYMLINK => core::str::from_utf8(self.data).ok().map(Node::Symlink),
-            CHARACTER_DEVICE => Some(Node::CharacterDevice(self.rdev.0, self.rdev.1)),
-            _ => None,
-        }
+        self.mode & mode::TYPE == mode::REGULAR
     }
 }
 
