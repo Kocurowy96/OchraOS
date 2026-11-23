@@ -26,6 +26,7 @@ mod memory;
 mod process;
 mod sched;
 mod selftest;
+mod signal;
 mod syscall;
 mod time;
 

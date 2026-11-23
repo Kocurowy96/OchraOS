@@ -15,7 +15,7 @@ use ochra_frame::sync::IrqMutex;
 use ochra_frame::{print, serial};
 
 use crate::errno::{EAGAIN, Errno};
-use crate::file::{File, flags};
+use crate::file::{File, Stat, device, flags, mode};
 use crate::sched::WaitQueue;
 
 struct Input {
@@ -97,7 +97,7 @@ impl File for Console {
         if buffer.is_empty() {
             return Ok(0);
         }
-        READERS.wait_until(|| {
+        READERS.wait_interruptible(|| {
             let mut input = INPUT.lock();
             if !input.ready.is_empty() {
                 let mut count = 0;
@@ -120,7 +120,7 @@ impl File for Console {
             } else {
                 None
             }
-        })
+        })?
     }
 
     fn write(&self, data: &[u8], _nonblocking: bool) -> Result<usize, Errno> {
@@ -131,6 +131,15 @@ impl File for Console {
 
     fn access_mode(&self) -> u32 {
         flags::O_RDWR
+    }
+
+    fn stat(&self) -> Stat {
+        // As Linux's `/dev/console`: character device 5:1.
+        Stat {
+            mode: mode::CHARACTER_DEVICE | 0o600,
+            rdev: device(5, 1),
+            ..Stat::default()
+        }
     }
 
     fn is_terminal(&self) -> bool {

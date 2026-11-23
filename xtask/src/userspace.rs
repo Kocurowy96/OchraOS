@@ -11,7 +11,9 @@
 //! Layout of the initramfs:
 //!
 //! ```text
-//! /init           userspace/init.c (the first program the kernel starts)
+//! /init           userspace/init.sh (the first program the kernel starts: a shell script)
+//! /dev/null       device 1:3, as in Linux; /dev/console, 5:1
+//! /bin/busybox    BusyBox (see `busybox`), with a symbolic link per applet: /bin/sh, /bin/cat…
 //! /bin/<name>     userspace/<name>.c
 //! /tests/<name>   userspace/tests/<name>.c (syscall tests, compared with the host Linux)
 //! ```
@@ -20,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::cpio::Archive;
-use crate::{Result, build_dir, musl, root, run, step};
+use crate::{Result, build_dir, busybox, musl, root, run, step};
 
 /// A compiled program.
 pub struct Program {
@@ -55,17 +57,33 @@ pub fn build() -> Result<(PathBuf, Vec<Program>)> {
                 Kind::PositionIndependent
             };
             compile(&musl, &source, &file, kind)?;
-            let path = match (prefix, name.as_str()) {
-                ("/bin", "init") => "/init".to_string(),
-                _ => format!("{prefix}/{name}"),
-            };
+            let path = format!("{prefix}/{name}");
             programs.push(Program { path, file });
         }
     }
+    let busybox = busybox::build(&build_dir()?, &musl)?;
 
     let mut archive = Archive::default();
     archive.directory("bin");
+    archive.directory("dev");
     archive.directory("tests");
+    archive.character_device("dev/null", 1, 3);
+    archive.character_device("dev/console", 5, 1);
+    archive.file(
+        "init",
+        0o755,
+        &std::fs::read(root().join("userspace/init.sh"))?,
+    );
+    archive.file("bin/busybox", 0o755, &std::fs::read(&busybox.binary)?);
+    for applet in &busybox.applets {
+        if programs
+            .iter()
+            .any(|program| program.path[1..] == format!("bin/{applet}"))
+        {
+            return Err(format!("/bin/{applet} is both a program and a BusyBox applet").into());
+        }
+        archive.symlink(&format!("bin/{applet}"), "busybox");
+    }
     for program in &programs {
         let data = std::fs::read(&program.file)?;
         archive.file(&program.path[1..], 0o755, &data);
@@ -155,7 +173,7 @@ fn compile(musl: &Path, source: &Path, output: &Path, kind: Kind) -> Result<()> 
         .arg(lib.join("crtn.o")))
 }
 
-fn gcc_output(arguments: &[&str]) -> Result<String> {
+pub fn gcc_output(arguments: &[&str]) -> Result<String> {
     let output = Command::new("gcc").args(arguments).output()?;
     if !output.status.success() {
         return Err(format!("gcc {} failed", arguments.join(" ")).into());

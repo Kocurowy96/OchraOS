@@ -8,8 +8,9 @@ use alloc::vec::Vec;
 use log::debug;
 
 use super::{SyscallResult, current, read_user, write_user};
-use crate::errno::{EFAULT, EINVAL, ENOTTY, Errno};
+use crate::errno::{EFAULT, EINVAL, ENOTTY, EPIPE, Errno};
 use crate::file::{self, Descriptor, MAX_DESCRIPTORS, OpenFile, flags};
+use crate::signal::{self, Info, SIGPIPE};
 
 /// Most bytes one `read` or `write` moves; the caller sees a short count and goes on with
 /// the rest, as POSIX allows.
@@ -38,9 +39,28 @@ pub fn read(fd: u64, buffer: u64, count: u64) -> SyscallResult {
     Ok(read as u64)
 }
 
+/// A write to a pipe that nobody reads fails with `EPIPE` and also sends `SIGPIPE` to the
+/// writer, which ends it unless it ignores or handles the signal (`man 7 pipe`).
+fn broken_pipe(result: SyscallResult) -> SyscallResult {
+    if result == Err(EPIPE)
+        && let Ok(process) = current()
+    {
+        let info = Info::Sent {
+            code: signal::code::SI_USER,
+            sender: process.id,
+        };
+        signal::send(&process, SIGPIPE, info);
+    }
+    result
+}
+
 /// `write(fd, buf, count)`. Copied in pieces of `MAX_TRANSFER`, but all of it is written
 /// unless the file takes less (a blocking pipe takes everything, as in Linux).
 pub fn write(fd: u64, buffer: u64, count: u64) -> SyscallResult {
+    broken_pipe(write_all(fd, buffer, count))
+}
+
+fn write_all(fd: u64, buffer: u64, count: u64) -> SyscallResult {
     let file = open_file(fd)?;
     let mut done: u64 = 0;
     loop {
@@ -106,6 +126,10 @@ pub fn readv(fd: u64, vector: u64, count: u64) -> SyscallResult {
 
 /// `writev(fd, iov, iovcnt)`: writes several buffers as one.
 pub fn writev(fd: u64, vector: u64, count: u64) -> SyscallResult {
+    broken_pipe(write_vector(fd, vector, count))
+}
+
+fn write_vector(fd: u64, vector: u64, count: u64) -> SyscallResult {
     let file = open_file(fd)?;
     let pieces = read_vector(vector, count)?;
     let mut bytes = Vec::new();

@@ -269,10 +269,13 @@ const STACK_SLOT_SIZE: u64 = 64 * 1024;
 /// Largest stack that still leaves a guard page in its slot.
 const MAX_STACK_PAGES: u64 = STACK_SLOT_SIZE / FRAME_SIZE - 1;
 static NEXT_STACK_SLOT: AtomicU64 = AtomicU64::new(0);
+/// Slots of dropped stacks, used again before new ones: otherwise every 32 new slots would
+/// need a new page table, which is never freed, and memory would shrink with every task.
+static FREE_STACK_SLOTS: IrqMutex<alloc::vec::Vec<u64>> = IrqMutex::new(alloc::vec::Vec::new());
 
 /// A kernel stack with an unmapped guard page below it. Dropping it unmaps and frees its
-/// pages (on every CPU: kernel pages are shared); its slot of virtual space is not reused
-/// (slot 509 has room for millions of stacks).
+/// pages (on every CPU: kernel pages are shared); its slot of virtual space is then free for
+/// the next stack.
 pub struct KernelStack {
     bottom: u64,
     top: u64,
@@ -285,7 +288,8 @@ impl KernelStack {
             (1..=MAX_STACK_PAGES).contains(&pages),
             "a kernel stack has 1..={MAX_STACK_PAGES} pages"
         );
-        let slot = NEXT_STACK_SLOT.fetch_add(1, Ordering::Relaxed);
+        let reused = FREE_STACK_SLOTS.lock().pop();
+        let slot = reused.unwrap_or_else(|| NEXT_STACK_SLOT.fetch_add(1, Ordering::Relaxed));
         let slot_start = STACKS_BASE + slot * STACK_SLOT_SIZE;
         let top = slot_start + STACK_SLOT_SIZE;
         let bottom = top - pages * FRAME_SIZE;
@@ -328,6 +332,9 @@ impl Drop for KernelStack {
             // SAFETY: the frame was owned by this stack's mapping, which is gone everywhere.
             drop(unsafe { frames::Frame::from_address(address) });
         }
+        // The slot is unmapped on every CPU now.
+        let slot = (self.top - STACKS_BASE) / STACK_SLOT_SIZE - 1;
+        FREE_STACK_SLOTS.lock().push(slot);
     }
 }
 

@@ -17,6 +17,13 @@ Security is priority number one.
 - **AVX state:** CR4.OSXSAVE stays off until the kernel saves the extended state with
   `xsave` on task switches; until then programs see no AVX (CPUID reports OSXSAVE clear), so
   they cannot leave AVX registers to leak into another process.
+- **SMAP and the AC flag:** user programs may set RFLAGS.AC, and an interrupt does not clear
+  it, so every kernel entry clears it (as Linux's `clac`); otherwise SMAP would be off while
+  the kernel handles an interrupt from such a program.
+- **Signal frames:** `rt_sigreturn` takes registers from user memory, so only the flags a
+  program may set itself are restored (interrupts stay on, I/O privilege stays 0), the
+  selectors never come from the frame, unsupported MXCSR bits are cleared before `fxrstor`,
+  and an instruction pointer in the kernel half becomes the program's own fault.
 - **Meltdown:** user page tables map the kernel half (supervisor-only) for now. Before
   OchraOS runs on a CPU affected by Meltdown (e.g. Haswell, as in the ThinkPad T440p), the
   kernel needs KPTI (separate user page tables without the kernel), switched off when

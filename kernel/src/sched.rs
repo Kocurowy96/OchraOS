@@ -31,6 +31,7 @@ use ochra_frame::mm::user::UserSpace;
 use ochra_frame::sync::IrqMutex;
 use ochra_frame::task::{self, Task};
 
+use crate::errno::{ERESTARTSYS, Errno};
 use crate::process::Process;
 
 /// The kernel's record of a task.
@@ -86,14 +87,10 @@ pub fn spawn_user(
     entry: u64,
     stack: u64,
     process: Option<Arc<Process>>,
-) {
-    enqueue(task::spawn_user(
-        name,
-        space,
-        entry,
-        stack,
-        Some(Thread::new(process)),
-    ));
+) -> Arc<Task> {
+    let task = task::spawn_user(name, space, entry, stack, Some(Thread::new(process)));
+    enqueue(task.clone());
+    task
 }
 
 /// Creates the task of a forked process (see `task::fork_user`) and queues it.
@@ -101,13 +98,10 @@ pub fn spawn_fork(
     space: Arc<UserSpace>,
     context: &ochra_frame::user_mode::UserContext,
     process: Arc<Process>,
-) {
-    enqueue(task::fork_user(
-        "user",
-        space,
-        context,
-        Some(Thread::new(Some(process))),
-    ));
+) -> Arc<Task> {
+    let task = task::fork_user("user", space, context, Some(Thread::new(Some(process))));
+    enqueue(task.clone());
+    task
 }
 
 /// Set by the boot CPU once the first tasks are queued; the other CPUs wait for it.
@@ -278,6 +272,18 @@ impl WaitQueue {
             block(&current);
             self.remove(&current);
         }
+    }
+
+    /// Like [`wait_until`](Self::wait_until), but gives up with `ERESTARTSYS` when a signal
+    /// is to be delivered to the current process: the syscall then ends (and may be run
+    /// again, see `signal::on_return`). `signal::send` wakes the task itself, so a signal
+    /// that comes while it waits is never missed.
+    pub fn wait_interruptible<T>(&self, mut ready: impl FnMut() -> Option<T>) -> Result<T, Errno> {
+        self.wait_until(|| match ready() {
+            Some(value) => Some(Ok(value)),
+            None if crate::signal::interrupted() => Some(Err(ERESTARTSYS)),
+            None => None,
+        })
     }
 
     /// Wakes every waiter.

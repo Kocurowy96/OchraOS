@@ -68,10 +68,24 @@ const CASES: &[Case] = &[
             "init: running as process 1",
             "Hello from musl",
             "init: /bin/hello exited with status 0",
-            "init: waiting for input",
-            "init: got \"ping\"",
+            "init: pipeline OCHRA",
+            "init: counted 5 lines",
+            "init: sum of squares 14",
+            "init: false gave 1",
+            "init: subshell gave 7",
+            "init: background job gave 9",
+            "init: trap ran for USR1",
+            "init: ochra ochra ochra from yes",
+            "init: here-document with 42",
+            "init: checks done",
+            "init: starting a shell",
+            "shell got 42",
+            "init: the shell exited with status 3",
+            "init: starting a shell",
         ],
         anywhere: &[
+            // `yes`, ended by SIGPIPE when `head` is done (the kernel logs it).
+            "(/bin/yes) killed by signal 13",
             "smp: 4 CPUs",
             "cpu 1 online",
             "cpu 2 online",
@@ -88,7 +102,7 @@ const CASES: &[Case] = &[
         qemu_args: &[],
         expected: &[
             "programs finished",
-            "no frames leaked",
+            "no frames or heap memory leaked",
             "boot finished, idling",
         ],
         anywhere: &[],
@@ -263,10 +277,11 @@ struct Typing {
 
 const TYPING: &[Typing] = &[Typing {
     case: "boot",
-    after: "init: waiting for input",
-    // Enter sends a carriage return, as on a real terminal.
-    keys: "ping\r",
-    until: &["init: got", "idling"],
+    after: "init: starting a shell",
+    // Two commands for the interactive shell; Enter sends a carriage return, as on a real
+    // terminal. The console holds the keys until the shell reads them.
+    keys: "echo shell got $((6 * 7))\rexit 3\r",
+    until: &["init: the shell exited with status 3", "idling"],
 }];
 
 /// Generous, so the test also passes without KVM (plain emulation on CI runners).

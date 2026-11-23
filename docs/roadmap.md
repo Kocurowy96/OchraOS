@@ -77,9 +77,11 @@ Checklist:
       XMM zero) and never sees another process's registers; a gap of 256 pages below the
       stack like Linux's `stack_guard_gap`, so `mmap` cannot place a mapping right under it
       (Stack Clash), with a test
-- [ ] P4: signals (`rt_sigaction`, `rt_sigprocmask`, `kill`, delivery, `rt_sigreturn`),
-      `EINTR` and `SA_RESTART`; busybox `sh` as init; boot test with a shell script
-- [ ] every syscall has a small C test program; its deterministic output is compared with
+- [x] P4: signals (`rt_sigaction`, `rt_sigprocmask`, `kill`, delivery, `rt_sigreturn`),
+      `EINTR` and `SA_RESTART`, `SIGPIPE`, `SIGCHLD`; busybox `sh` as init (`#!` scripts,
+      symbolic links, `/dev/null`, `open`/`stat` on the initramfs); boot test with a shell
+      script and an interactive shell on the console
+- [x] every syscall has a small C test program; its deterministic output is compared with
       the same program run on the host Linux
 
 ## Stage 3 — Files and disks

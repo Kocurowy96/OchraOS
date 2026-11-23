@@ -83,7 +83,7 @@ fn read_strings(array: u64, total: &mut usize) -> Result<Vec<Vec<u8>>, Errno> {
 pub fn exit(status: i32) -> SyscallResult {
     let exit = Exit::Status(status as u8);
     match process::current() {
-        Some(process) => process::exit(&process, exit),
+        Some(process) => process::exit(process, exit),
         None => {
             let name = task::current().map_or("?", |task| task.name());
             info!("user task {name} {exit}");

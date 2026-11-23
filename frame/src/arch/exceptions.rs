@@ -32,6 +32,9 @@ use crate::arch::{halt_forever, interrupts};
 use crate::color::{BOLD, RED, RESET};
 use crate::{SHOW_ADDRESSES, serial};
 
+/// RFLAGS bit 18, AC: alignment check in ring 3, and SMAP switched off in ring 0.
+pub(crate) const ALIGNMENT_CHECK_FLAG: u64 = 1 << 18;
+
 /// The stack contents when `handle_exception` is called, lowest address first:
 /// the registers saved by `common_entry`, then what the stub and the CPU pushed.
 #[repr(C)]
@@ -246,8 +249,16 @@ pub(super) extern "C" fn common_body() {
         "mov rdi, rsp",
         // The ABI expects the direction flag clear; the interrupted code may have set it.
         "cld",
+        // AC must be clear in the kernel: with AC set, SMAP lets every kernel access to user
+        // memory through. Ring 3 may set it (`popf`) and an interrupt does not clear it, so
+        // clear it here, as Linux does with `clac` (`popf` works without SMAP too). The
+        // interrupted code gets its own flags back from `iretq`.
+        "pushfq",
+        "and qword ptr [rsp], {not_ac}",
+        "popfq",
         "call {handler}",
         "jmp {exit}",
+        not_ac = const !(ALIGNMENT_CHECK_FLAG as i64),
         handler = sym handle_exception,
         exit = sym common_exit,
     )

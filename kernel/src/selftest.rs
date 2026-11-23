@@ -89,10 +89,12 @@ fn run_user_tests() -> ! {
     }
     log::info!("user tests: {} programs finished", names.len());
 
-    // Everything a process had (pages, page tables, kernel stack) must come back. The first
-    // round also grew the kernel heap, so compare two more rounds with each other.
+    // Everything a process had (pages, page tables, kernel stack, its records on the heap)
+    // must come back. The first round also grew the kernel heap and its tables, so compare
+    // two more rounds with each other.
     let mut free = [0; 2];
-    for round in &mut free {
+    let mut heap_used = [0; 2];
+    for (round, used) in free.iter_mut().zip(&mut heap_used) {
         for name in &names {
             run_user_test(name);
         }
@@ -102,10 +104,16 @@ fn run_user_tests() -> ! {
             ochra_frame::arch::interrupts::wait();
         }
         *round = ochra_frame::mm::frames::stats().free;
+        *used = ochra_frame::mm::heap::stats().used;
     }
     let leaked = free[0].saturating_sub(free[1]);
     assert_eq!(leaked, 0, "user tests: {leaked} frames leaked in one round");
-    log::info!("user tests: no frames leaked over two more rounds");
+    let heap_leaked = heap_used[1].saturating_sub(heap_used[0]);
+    assert_eq!(
+        heap_leaked, 0,
+        "user tests: {heap_leaked} heap bytes leaked in one round"
+    );
+    log::info!("user tests: no frames or heap memory leaked over two more rounds");
     USER_TESTS_RUNNING.store(false, core::sync::atomic::Ordering::Release);
     crate::sched::exit_current()
 }

@@ -231,6 +231,36 @@ pub fn reset_fpu() {
     unsafe { load_fpu(&initial) };
 }
 
+/// The current task's x87/SSE registers in the 512-byte `fxsave` format (for a signal
+/// frame, which keeps them on the user stack while the handler runs).
+pub fn fpu_state() -> [u8; 512] {
+    let mut state = FpuState([0; 512]);
+    // SAFETY: `state` is a local, 16-byte aligned area; `fxsave` only reads the registers.
+    unsafe { save_fpu(&mut state) };
+    state.0
+}
+
+/// Loads the current task's x87/SSE registers from `state` (`fxsave` format), which the
+/// program may have changed (`rt_sigreturn`). MXCSR bits the CPU does not support are
+/// cleared first: `fxrstor` would raise #GP on them in the kernel. Every other field is
+/// accepted by `fxrstor` as it is.
+pub fn set_fpu_state(state: &[u8; 512]) {
+    let mut checked = FpuState(*state);
+    let mask = mxcsr_mask();
+    let mxcsr = u32::from_le_bytes(checked.0[24..28].try_into().expect("4 bytes")) & mask;
+    checked.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    // SAFETY: MXCSR holds only supported bits now, so `fxrstor` cannot fault; it replaces
+    // only the current task's live registers, which the kernel itself never uses.
+    unsafe { load_fpu(&checked) };
+}
+
+/// The MXCSR bits this CPU supports: what `fxsave` reports at bytes 28–31, or the default
+/// 0xFFBF when it reports 0 (Intel SDM, "Guidelines for writing to the MXCSR register").
+fn mxcsr_mask() -> u32 {
+    let reported = u32::from_le_bytes(fpu_state()[28..32].try_into().expect("4 bytes"));
+    if reported == 0 { 0xFFBF } else { reported }
+}
+
 /// First code of a user task, on its kernel stack: off to user mode.
 fn start_user_task() -> ! {
     let task = current().expect("a task is running");
@@ -242,7 +272,13 @@ fn start_user_task() -> ! {
     drop(task);
     match start {
         UserStart::Fresh { entry, stack } => user_mode::enter(entry, stack),
-        UserStart::Resume(frame) => user_mode::resume(*frame),
+        UserStart::Resume(boxed) => {
+            // `resume` never returns, so nothing after it would free the box: take the
+            // registers out and free it first.
+            let frame = (*boxed).clone();
+            drop(boxed);
+            user_mode::resume(frame)
+        }
     }
 }
 

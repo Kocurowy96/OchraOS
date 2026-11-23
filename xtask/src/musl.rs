@@ -9,36 +9,30 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{Result, run, run_logged, step};
+use crate::git::Pinned;
+use crate::{Result, run_logged, step};
 
-const REPOSITORY: &str = "https://git.musl-libc.org/git/musl";
-/// To upgrade: change both; the commit is printed by `git ls-remote <repository> <tag>`.
-const TAG: &str = "v1.2.6";
-const COMMIT: &str = "9fa28ece75d8a2191de7c5bb53bed224c5947417";
+const MUSL: Pinned = Pinned {
+    name: "musl",
+    repository: "https://git.musl-libc.org/git/musl",
+    tag: "v1.2.6",
+    commit: "9fa28ece75d8a2191de7c5bb53bed224c5947417",
+};
 
 /// Returns musl's install prefix (with `include/` and `lib/`), building it first if needed.
 pub fn build(build_dir: &Path) -> Result<PathBuf> {
+    let tag = MUSL.tag;
     let dir = build_dir.join("musl");
-    let install = dir.join(format!("install-{TAG}"));
+    let install = dir.join(format!("install-{tag}"));
     if install.join("lib/libc.a").exists() {
         return Ok(install);
     }
 
-    let source = dir.join(format!("src-{TAG}"));
-    if !source.exists() {
-        step(&format!("fetching musl {TAG}"));
-        std::fs::create_dir_all(&dir)?;
-        run(Command::new("git")
-            .args([
-                "clone", "--quiet", "--depth", "1", "--branch", TAG, REPOSITORY,
-            ])
-            .arg(&source)
-            .env("GIT_ADVICE", "0"))?;
-    }
-    verify(&source)?;
+    let source = dir.join(format!("src-{tag}"));
+    MUSL.fetch(&source)?;
 
-    step(&format!("building musl {TAG} (only the first time)"));
-    let objects = dir.join(format!("obj-{TAG}"));
+    step(&format!("building musl {tag} (only the first time)"));
+    let objects = dir.join(format!("obj-{tag}"));
     std::fs::create_dir_all(&objects)?;
     let log = dir.join("build.log");
     // Static library only; no `musl-gcc` wrapper (its specs file mishandles static-pie, so
@@ -67,22 +61,4 @@ pub fn build(build_dir: &Path) -> Result<PathBuf> {
         &log,
     )?;
     Ok(install)
-}
-
-/// Fails unless the checked-out commit is the pinned one.
-fn verify(source: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(source)
-        .args(["rev-parse", "HEAD"])
-        .output()?;
-    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if commit != COMMIT {
-        return Err(format!(
-            "musl {TAG} is commit {commit}, expected {COMMIT}; delete {} to fetch it again",
-            source.display()
-        )
-        .into());
-    }
-    Ok(())
 }

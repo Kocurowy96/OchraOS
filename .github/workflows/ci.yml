@@ -66,6 +66,14 @@ jobs:
         with:
           path: build/musl
           key: musl-${{ runner.os }}-${{ hashFiles('xtask/src/musl.rs') }}
+      # BusyBox too (xtask/src/busybox.rs), linked against that musl with our configuration.
+      - name: Cache the BusyBox build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/busybox
+          key: >-
+            busybox-${{ runner.os }}-${{ hashFiles('xtask/src/busybox.rs', 'xtask/src/musl.rs',
+            'userspace/busybox.config') }}
       - run: cargo xtask build
       - run: cargo xtask test
       - name: Upload the logs
@@ -78,6 +86,7 @@ jobs:
             build/failed/*.log
             build/limine/build.log
             build/musl/build.log
+            build/busybox/build.log
           if-no-files-found: ignore
 
   dco:

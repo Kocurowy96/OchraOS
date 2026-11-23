@@ -84,6 +84,57 @@ impl UserContext {
         };
     }
 
+    /// The general registers, instruction pointer and flags (for a signal frame).
+    pub fn registers(&self) -> Registers {
+        let f = &self.0;
+        Registers {
+            r8: f.r8,
+            r9: f.r9,
+            r10: f.r10,
+            r11: f.r11,
+            r12: f.r12,
+            r13: f.r13,
+            r14: f.r14,
+            r15: f.r15,
+            rdi: f.rdi,
+            rsi: f.rsi,
+            rbp: f.rbp,
+            rbx: f.rbx,
+            rdx: f.rdx,
+            rax: f.rax,
+            rcx: f.rcx,
+            rsp: f.rsp,
+            rip: f.rip,
+            rflags: f.rflags,
+        }
+    }
+
+    /// Sets the registers (to run a signal handler, or back from one: `rt_sigreturn`). The
+    /// values may come from the program. Of the flags, only those a program may change
+    /// itself are taken (Linux's `FIX_EFLAGS`); interrupts stay on and the I/O privilege
+    /// level stays 0, so the program cannot gain anything. The selectors are not touched.
+    pub fn set_registers(&mut self, registers: &Registers) {
+        let f = &mut self.0;
+        f.r8 = registers.r8;
+        f.r9 = registers.r9;
+        f.r10 = registers.r10;
+        f.r11 = registers.r11;
+        f.r12 = registers.r12;
+        f.r13 = registers.r13;
+        f.r14 = registers.r14;
+        f.r15 = registers.r15;
+        f.rdi = registers.rdi;
+        f.rsi = registers.rsi;
+        f.rbp = registers.rbp;
+        f.rbx = registers.rbx;
+        f.rdx = registers.rdx;
+        f.rax = registers.rax;
+        f.rcx = registers.rcx;
+        f.rsp = registers.rsp;
+        f.rip = registers.rip;
+        f.rflags = registers.rflags & USER_FLAGS | FIXED_FLAGS;
+    }
+
     pub(crate) fn frame(&self) -> &ExceptionFrame {
         &self.0
     }
@@ -96,6 +147,44 @@ impl UserContext {
         unsafe { &mut *(frame as *mut ExceptionFrame).cast::<Self>() }
     }
 }
+
+/// The user registers a signal frame saves (`struct sigcontext` in Linux).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Registers {
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdx: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rsp: u64,
+    pub rip: u64,
+    pub rflags: u64,
+}
+
+/// The flags a user program may set: CF, PF, AF, ZF, SF, TF, DF, OF, RF and AC (Linux's
+/// `FIX_EFLAGS`). AC is harmless in ring 3; the kernel clears it on every entry.
+pub const USER_FLAGS: u64 = 1 << 0
+    | 1 << 2
+    | 1 << 4
+    | 1 << 6
+    | 1 << 7
+    | 1 << 8
+    | 1 << 10
+    | 1 << 11
+    | 1 << 16
+    | exceptions::ALIGNMENT_CHECK_FLAG;
+/// Always set in user mode: IF (bit 9, interrupts on) and bit 1, which is always one.
+const FIXED_FLAGS: u64 = 1 << 9 | 1 << 1;
 
 /// A CPU exception raised by a user program.
 #[derive(Clone, Copy, Debug)]
@@ -116,6 +205,9 @@ impl fmt::Display for UserFault {
     }
 }
 
+/// What the kernel does just before any return to user mode (after a syscall, interrupt or
+/// exception): deliver pending signals, for example. It may change the context.
+pub type ReturnHandler = fn(&mut UserContext);
 /// What the kernel does for a syscall.
 pub type SyscallHandler = fn(&mut UserContext);
 /// What the kernel does when a user program faults. If it returns, the program continues
@@ -126,6 +218,7 @@ pub type FaultHandler = fn(&mut UserContext, UserFault);
 
 static SYSCALL_HANDLER: Once<SyscallHandler> = Once::new();
 static FAULT_HANDLER: Once<FaultHandler> = Once::new();
+static RETURN_HANDLER: Once<ReturnHandler> = Once::new();
 
 pub fn set_syscall_handler(handler: SyscallHandler) {
     SYSCALL_HANDLER.call_once(|| handler);
@@ -135,8 +228,13 @@ pub fn set_fault_handler(handler: FaultHandler) {
     FAULT_HANDLER.call_once(|| handler);
 }
 
-/// Handles a syscall, interrupt or exception that came from user mode, then checks that the
-/// frame is fit to return to user mode. Interrupts are off on entry and on return.
+pub fn set_return_handler(handler: ReturnHandler) {
+    RETURN_HANDLER.call_once(|| handler);
+}
+
+/// Handles a syscall, interrupt or exception that came from user mode, runs the return
+/// handler, then checks that the frame is fit to return to user mode. Interrupts are off on
+/// entry and on return.
 pub(crate) fn handle(frame: &mut ExceptionFrame) {
     match frame.vector {
         SYSCALL_VECTOR => {
@@ -158,9 +256,19 @@ pub(crate) fn handle(frame: &mut ExceptionFrame) {
             report_fault(frame, fault);
         }
     }
-    // `iretq` to an address in the kernel half would fault in ring 0; treat it as the
-    // program's own general protection fault instead.
-    while frame.rip >= USER_END {
+    loop {
+        if let Some(handler) = RETURN_HANDLER.get() {
+            interrupts::enable();
+            // SAFETY: the frame came from user mode.
+            handler(unsafe { UserContext::from_frame(frame) });
+            interrupts::disable();
+        }
+        // `iretq` to an address in the kernel half would fault in ring 0; treat it as the
+        // program's own general protection fault instead (which may run a signal handler,
+        // so the return handler runs again).
+        if frame.rip < USER_END {
+            break;
+        }
         let fault = UserFault {
             vector: exceptions::GENERAL_PROTECTION as u8,
             error_code: 0,
@@ -189,8 +297,7 @@ fn fresh_frame(entry: u64, stack: u64) -> ExceptionFrame {
     let mut frame = ExceptionFrame::zeroed();
     frame.rip = entry;
     frame.cs = u64::from(USER_CODE);
-    // IF (bit 9) on, plus bit 1, which is always set.
-    frame.rflags = 1 << 9 | 1 << 1;
+    frame.rflags = FIXED_FLAGS;
     frame.rsp = stack;
     frame.ss = u64::from(USER_DATA);
     frame
