@@ -10,9 +10,12 @@ mod files;
 mod memory;
 mod names;
 mod paths;
+mod poll;
 mod process;
 mod signal;
 mod system;
+
+pub use system::{ABI_TARGET_RELEASE, VERSION};
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,7 +24,9 @@ use log::{debug, info};
 use ochra_frame::task;
 use ochra_frame::user_mode::{self, UserContext, UserFault, copy_from_user, copy_to_user};
 
-use crate::errno::{EFAULT, ENOSYS, ERESTARTNOHAND, ERESTARTNOINTR, ERESTARTSYS, Errno};
+use crate::errno::{
+    EFAULT, ENOSYS, ERESTART_RESTARTBLOCK, ERESTARTNOHAND, ERESTARTNOINTR, ERESTARTSYS, Errno,
+};
 use crate::process::Process;
 
 /// Linux x86-64 syscall numbers (`arch/x86/entry/syscalls/syscall_64.tbl`).
@@ -33,6 +38,7 @@ mod number {
     pub const STAT: u64 = 4;
     pub const FSTAT: u64 = 5;
     pub const LSTAT: u64 = 6;
+    pub const POLL: u64 = 7;
     pub const LSEEK: u64 = 8;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
@@ -48,6 +54,7 @@ mod number {
     pub const WRITEV: u64 = 20;
     pub const ACCESS: u64 = 21;
     pub const PIPE: u64 = 22;
+    pub const SELECT: u64 = 23;
     pub const SCHED_YIELD: u64 = 24;
     pub const DUP: u64 = 32;
     pub const DUP2: u64 = 33;
@@ -89,8 +96,12 @@ mod number {
     pub const GETGID: u64 = 104;
     pub const GETEUID: u64 = 107;
     pub const GETEGID: u64 = 108;
+    pub const SETPGID: u64 = 109;
     pub const GETPPID: u64 = 110;
     pub const GETPGRP: u64 = 111;
+    pub const SETSID: u64 = 112;
+    pub const GETPGID: u64 = 121;
+    pub const GETSID: u64 = 124;
     pub const RT_SIGPENDING: u64 = 127;
     pub const RT_SIGSUSPEND: u64 = 130;
     pub const MKNOD: u64 = 133;
@@ -101,6 +112,7 @@ mod number {
     pub const TIME: u64 = 201;
     pub const GETDENTS64: u64 = 217;
     pub const SET_TID_ADDRESS: u64 = 218;
+    pub const RESTART_SYSCALL: u64 = 219;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const CLOCK_GETRES: u64 = 229;
     pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -118,6 +130,8 @@ mod number {
     pub const READLINKAT: u64 = 267;
     pub const FCHMODAT: u64 = 268;
     pub const FACCESSAT: u64 = 269;
+    pub const PSELECT6: u64 = 270;
+    pub const PPOLL: u64 = 271;
     pub const UTIMENSAT: u64 = 280;
     pub const DUP3: u64 = 292;
     pub const PIPE2: u64 = 293;
@@ -217,6 +231,14 @@ fn dispatch(context: &mut UserContext) {
             process::identity(number)
         }
         number::GETPGRP => process::getpgrp(),
+        number::SETPGID => process::setpgid(a0, a1),
+        number::GETPGID => process::getpgid(a0),
+        number::SETSID => process::setsid(),
+        number::GETSID => process::getsid(a0),
+        number::POLL => poll::poll(a0, a1, a2),
+        number::PPOLL => poll::ppoll(a0, a1, a2, a3, a4),
+        number::SELECT => poll::select(a0, a1, a2, a3, a4),
+        number::PSELECT6 => poll::pselect6(a0, a1, a2, a3, a4, a5),
         number::SCHED_YIELD => process::sched_yield(),
         number::ARCH_PRCTL => process::arch_prctl(a0, a1),
         number::SET_TID_ADDRESS => process::getpid(),
@@ -233,6 +255,7 @@ fn dispatch(context: &mut UserContext) {
         number::CLOCK_GETRES => system::clock_getres(a0, a1),
         number::CLOCK_NANOSLEEP => system::clock_nanosleep(a0, a1, a2, a3),
         number::NANOSLEEP => system::nanosleep(a0, a1),
+        number::RESTART_SYSCALL => system::restart_syscall(),
         number::GETTIMEOFDAY => system::gettimeofday(a0, a1),
         number::TIME => system::time(a0),
         number::TKILL => signal::tkill(a0 as i32, a1),
@@ -246,7 +269,7 @@ fn dispatch(context: &mut UserContext) {
     if number == number::EXECVE && result.is_ok() {
         return;
     }
-    if let Err(ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND) = result
+    if let Err(ERESTARTSYS | ERESTARTNOINTR | ERESTARTNOHAND | ERESTART_RESTARTBLOCK) = result
         && let Ok(process) = current()
     {
         // A signal interrupted the syscall; `signal::on_return` decides what the program sees.

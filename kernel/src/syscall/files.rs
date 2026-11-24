@@ -23,10 +23,7 @@ fn open_file(fd: u64) -> Result<alloc::sync::Arc<OpenFile>, Errno> {
     match current() {
         Ok(process) => process.files.lock().file(fd),
         // The built-in ring 3 self-tests have no process; they write to the console.
-        Err(_) if fd == 1 || fd == 2 => Ok(OpenFile::new(
-            alloc::sync::Arc::new(crate::console::Console),
-            0,
-        )),
+        Err(_) if fd == 1 || fd == 2 => Ok(OpenFile::new(crate::tty::console_file(), 0)),
         Err(_) => Err(EBADF),
     }
 }
@@ -228,28 +225,38 @@ pub fn close(fd: u64) -> SyscallResult {
     Ok(0)
 }
 
-/// `ioctl(fd, request, argp)`: only what the C library asks a terminal about.
+/// `ioctl(fd, request, argp)`: the requests about any descriptor here, the rest by the
+/// file (terminals answer most).
 pub fn ioctl(fd: u64, request: u64, argument: u64) -> SyscallResult {
-    /// Get the window size (`struct winsize`).
-    const TIOCGWINSZ: u64 = 0x5413;
-    let file = open_file(fd)?;
-    if !file.file.is_terminal() {
-        return Err(ENOTTY);
-    }
+    // The request is an `unsigned int`: C libraries pass it as an `int`, so one with the top
+    // bit set (`TIOCGPTN`, 0x80045430) arrives sign-extended.
+    let request = u64::from(request as u32);
+    /// Set or clear `O_NONBLOCK` (`int *argp`).
+    const FIONBIO: u64 = 0x5421;
+    /// Clear or set close-on-exec.
+    const FIONCLEX: u64 = 0x5450;
+    const FIOCLEX: u64 = 0x5451;
     match request {
-        TIOCGWINSZ => {
-            // The serial console has no size; 24 rows of 80 columns, the classic terminal.
-            let rows: u16 = 24;
-            let columns: u16 = 80;
-            let mut size = [0; 8];
-            size[..2].copy_from_slice(&rows.to_le_bytes());
-            size[2..4].copy_from_slice(&columns.to_le_bytes());
-            write_user(argument, &size)?;
+        FIOCLEX | FIONCLEX => {
+            let process = current()?;
+            process.files.lock().get_mut(fd)?.close_on_exec = request == FIOCLEX;
+            Ok(0)
+        }
+        FIONBIO => {
+            let file = open_file(fd)?;
+            let mut bytes = [0; 4];
+            read_user(&mut bytes, argument)?;
+            let on = i32::from_le_bytes(bytes) != 0;
+            file.set_status_flags(if on { flags::O_NONBLOCK } else { 0 });
             Ok(0)
         }
         _ => {
-            debug!("ioctl {request:#x} on the console is not implemented");
-            Err(ENOTTY)
+            let file = open_file(fd)?;
+            let result = file.file.ioctl(request, argument);
+            if result == Err(ENOTTY) {
+                debug!("ioctl {request:#x} on fd {fd}: not for this file");
+            }
+            result
         }
     }
 }

@@ -5,6 +5,10 @@
 # runs through the `#!` line. It checks that the shell works (each check prints one line that
 # `cargo xtask test` looks for), then starts an interactive shell on the console, again and
 # again: init must never exit (the kernel panics if it does, as Linux does).
+#
+# The shell runs in a session of its own with the console as its controlling terminal
+# (`setsid -c`), as getty would set up a login: that is what job control needs. The kernel
+# never gives /dev/console to a session by itself.
 
 echo "init: running as process $$"
 
@@ -57,6 +61,6 @@ cd /
 echo "init: checks done"
 while true; do
     echo "init: starting a shell"
-    /bin/sh
+    setsid -c /bin/sh
     echo "init: the shell exited with status $?"
 done

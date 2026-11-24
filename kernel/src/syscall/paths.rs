@@ -154,20 +154,26 @@ pub fn openat(dirfd: i32, path: u64, open_flags: u64, permissions: u64) -> Sysca
         }
         may_access(&metadata, &credentials, wanted)?;
     }
-    let file: Arc<dyn File> = match metadata.file_type() {
-        mode::CHARACTER_DEVICE => {
-            let device = file::open_device(metadata.rdev)?;
-            Arc::new(DeviceNode::new(found, device, access_mode))
-        }
-        mode::REGULAR | mode::DIRECTORY => {
-            if metadata.is_regular() && open_flags & O_TRUNC != 0 && metadata.size != 0 {
-                vfs::truncate(&found, 0)?;
+    let own = found.inode().open(&found, access_mode);
+    let file: Arc<dyn File> = if let Some(own) = own {
+        // A filesystem that makes its own open files (procfs).
+        own?
+    } else {
+        match metadata.file_type() {
+            mode::CHARACTER_DEVICE => {
+                let device = file::open_device(metadata.rdev, open_flags)?;
+                Arc::new(DeviceNode::new(found, device, access_mode))
             }
-            let append = open_flags & flags::O_APPEND != 0;
-            Arc::new(VfsFile::new(found, access_mode, append))
+            mode::REGULAR | mode::DIRECTORY => {
+                if metadata.is_regular() && open_flags & O_TRUNC != 0 && metadata.size != 0 {
+                    vfs::truncate(&found, 0)?;
+                }
+                let append = open_flags & flags::O_APPEND != 0;
+                Arc::new(VfsFile::new(found, access_mode, append))
+            }
+            // FIFOs and sockets cannot be made yet.
+            _ => return Err(crate::errno::ENXIO),
         }
-        // FIFOs and sockets cannot be made yet.
-        _ => return Err(crate::errno::ENXIO),
     };
     let descriptor = Descriptor {
         file: OpenFile::new(file, open_flags),

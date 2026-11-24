@@ -80,7 +80,10 @@ fn run_user_tests() -> ! {
         .collect();
     names.sort_unstable();
     for name in &names {
+        let started = crate::time::monotonic();
         let (ending, output) = run_user_test(name);
+        let took = (crate::time::monotonic() - started) / 1_000_000;
+        log::debug!("user test {name} took {took} ms");
         let hex: alloc::string::String = output
             .iter()
             .map(|byte| alloc::format!("{byte:02x}"))
@@ -137,7 +140,7 @@ fn run_user_test(name: &str) -> (alloc::string::String, alloc::vec::Vec<u8>) {
     for (fd, file) in [
         (0, Arc::new(Null) as Arc<dyn file::File>),
         (1, writer),
-        (2, Arc::new(crate::console::Console)),
+        (2, crate::tty::console_file()),
     ] {
         let _ = files.insert_at(fd, descriptor(file, 0));
     }
@@ -193,6 +196,22 @@ pub fn run_checks() {
     check_interrupts();
     check_timer();
     check_user_space();
+    check_terminal();
+}
+
+/// Terminals: `TIOCSTI` (pushing bytes into a terminal's input, as if typed) is refused
+/// with `EIO`, always (docs/security.md). Tested here rather than against the host, whose
+/// answer depends on its `dev.tty.legacy_tiocsti` setting.
+#[cfg(feature = "selftest")]
+fn check_terminal() {
+    const TIOCSTI: u64 = 0x5412;
+    let console = crate::tty::console_file();
+    assert_eq!(
+        console.ioctl(TIOCSTI, 0),
+        Err(crate::errno::EIO),
+        "self-test terminal: TIOCSTI was not refused"
+    );
+    log::info!("self-test terminal: ok");
 }
 
 /// Runs every check. Without the `selftest` feature it does nothing.

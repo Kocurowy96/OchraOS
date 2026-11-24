@@ -23,6 +23,12 @@
 //!   (the user-program tests), orphans are collected by the kernel itself.
 //! - init must never end: that is a kernel panic, as in Linux.
 //!
+//! Sessions and process groups (`man 7 credentials`, `man 2 setsid`): a process group is a
+//! job (a pipeline the shell started); a session is the groups of one login. A session may
+//! have a controlling terminal, whose foreground group gets the terminal's signals (Ctrl-C)
+//! and may read from it. A group whose members' parents are all inside it or outside the
+//! session is "orphaned": nobody could continue it, so it may not stay stopped.
+//!
 //! For now a process has one task (thread).
 
 use alloc::collections::BTreeMap;
@@ -40,11 +46,12 @@ use ochra_frame::task::{self, Task};
 use ochra_frame::user_mode::UserContext;
 
 use crate::elf::{self, Elf, Kind};
-use crate::errno::{E2BIG, EACCES, ECHILD, ELOOP, ENOEXEC, ENOMEM, ESRCH, Errno};
+use crate::errno::{E2BIG, EACCES, ECHILD, ELOOP, ENOEXEC, ENOMEM, EPERM, ESRCH, Errno};
 use crate::file::FdTable;
 use crate::memory::{self, Memory, page_down, page_up};
 use crate::sched::{self, WaitQueue};
 use crate::signal::{self, SIGCHLD, Signals};
+use crate::tty::Tty;
 use crate::vfs::{self, Access, Credentials, Walk, may_access};
 
 pub struct Process {
@@ -52,8 +59,29 @@ pub struct Process {
     /// The parent's ID; 0 if the kernel started the process (or it was orphaned without
     /// an init to take it).
     parent: AtomicU32,
-    /// The process group (for `wait4` with a group); inherited, for now never changed.
+    /// The process group: inherited, changed by `setpgid` and `setsid`.
     group: AtomicU32,
+    /// The session: inherited, changed by `setsid`.
+    session: AtomicU32,
+    /// The controlling terminal (inherited). It counts only while the terminal still belongs
+    /// to this process's session: see [`controlling_tty`].
+    pub controlling_tty: IrqMutex<Option<Arc<Tty>>>,
+    /// Whether the process has called `execve` (its parent may no longer move it to another
+    /// group, `setpgid` gives `EACCES`).
+    executed: AtomicBool,
+    /// Stopped by a signal, and what `wait4` has not reported yet.
+    job: IrqMutex<Job>,
+    /// Woken when the process is continued (or killed while stopped).
+    resumed: WaitQueue,
+    /// When it started, in monotonic nanoseconds (`/proc/<pid>/stat`).
+    pub started: u64,
+    /// The program file, for `/proc/<pid>/exe`.
+    pub executable: IrqMutex<Option<vfs::Path>>,
+    /// The arguments and the environment of the program, each string with its NUL
+    /// (`/proc/<pid>/cmdline` and `environ`). Linux reads them from the process's memory;
+    /// these are copies taken at `execve`.
+    pub arguments: IrqMutex<Vec<u8>>,
+    pub environment: IrqMutex<Vec<u8>>,
     /// The program's path, for the log.
     name: IrqMutex<String>,
     /// The current directory.
@@ -75,6 +103,20 @@ pub struct Process {
     pub signals: IrqMutex<Signals>,
     /// The process's task (thread), for signals to wake it.
     task: IrqMutex<Weak<Task>>,
+}
+
+/// Job control state.
+#[derive(Default)]
+struct Job {
+    stopped: bool,
+    /// What the parent's `wait4` has yet to see.
+    report: Option<Report>,
+}
+
+#[derive(Clone, Copy)]
+enum Report {
+    Stopped(u8),
+    Continued,
 }
 
 /// How a process ended (what `wait4` reports).
@@ -118,6 +160,19 @@ impl Process {
         self.name.lock().clone()
     }
 
+    pub fn group(&self) -> u32 {
+        self.group.load(Ordering::Relaxed)
+    }
+
+    pub fn session(&self) -> u32 {
+        self.session.load(Ordering::Relaxed)
+    }
+
+    /// Whether the process is stopped (`/proc/<pid>/stat`).
+    pub fn is_stopped(&self) -> bool {
+        self.job.lock().stopped
+    }
+
     /// The address space; `ESRCH` once the process has exited (it never runs then).
     pub fn space(&self) -> Result<Arc<UserSpace>, Errno> {
         self.space.lock().clone().ok_or(ESRCH)
@@ -129,11 +184,20 @@ impl Process {
     }
 
     /// A new process record, not yet in the table and without a task.
-    fn new(parent: u32, group: u32, name: String, space: Arc<UserSpace>) -> Self {
+    fn new(parent: u32, group: u32, session: u32, name: String, space: Arc<UserSpace>) -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             parent: AtomicU32::new(parent),
             group: AtomicU32::new(group),
+            session: AtomicU32::new(session),
+            controlling_tty: IrqMutex::new(None),
+            executed: AtomicBool::new(false),
+            job: IrqMutex::new(Job::default()),
+            resumed: WaitQueue::new(),
+            started: crate::time::monotonic(),
+            executable: IrqMutex::new(None),
+            arguments: IrqMutex::new(Vec::new()),
+            environment: IrqMutex::new(Vec::new()),
             name: IrqMutex::new(name),
             cwd: IrqMutex::new(vfs::root()),
             credentials: IrqMutex::new(Credentials::root()),
@@ -170,6 +234,9 @@ pub struct Image {
     memory: Memory,
     entry: u64,
     stack_pointer: u64,
+    executable: Option<vfs::Path>,
+    arguments: Vec<u8>,
+    environment: Vec<u8>,
 }
 
 /// Most interpreters in a row (a script whose interpreter is a script…), as in Linux.
@@ -189,10 +256,14 @@ pub fn load_program(
     let mut arguments: Vec<Vec<u8>> = arguments.iter().map(|text| text.to_vec()).collect();
     let mut file_path = String::from(path);
     for _ in 0..=MAX_INTERPRETERS {
-        let file = read_program(cwd, credentials, &file_path)?;
+        let (file, found) = read_program(cwd, credentials, &file_path)?;
         let Some((interpreter, argument)) = script_interpreter(&file)? else {
             let arguments: Vec<&[u8]> = arguments.iter().map(Vec::as_slice).collect();
-            return load_elf(&file, path, &arguments, environment);
+            let mut image = load_elf(&file, path, &arguments, environment)?;
+            image.executable = Some(found);
+            image.arguments = joined(&arguments);
+            image.environment = joined(environment);
+            return Ok(image);
         };
         // The interpreter gets: its own name, the optional argument from the `#!` line,
         // the script's path, then the original arguments after the first.
@@ -208,7 +279,11 @@ pub fn load_program(
 
 /// Reads the whole program file at `path`: a regular file that `credentials` may execute.
 /// Set-user-ID and set-group-ID bits are ignored until there are users (`docs/security.md`).
-fn read_program(cwd: &vfs::Path, credentials: &Credentials, path: &str) -> Result<Vec<u8>, Errno> {
+fn read_program(
+    cwd: &vfs::Path,
+    credentials: &Credentials,
+    path: &str,
+) -> Result<(Vec<u8>, vfs::Path), Errno> {
     let found = cwd.walk(path, Walk::Follow, credentials)?;
     let metadata = found.metadata();
     if !metadata.is_regular() {
@@ -222,7 +297,17 @@ fn read_program(cwd: &vfs::Path, credentials: &Credentials, path: &str) -> Resul
     let read = cache.read(inode.as_ref(), 0, &mut file, metadata.size)?;
     file.truncate(read);
     vfs::touch_accessed(&found);
-    Ok(file)
+    Ok((file, found))
+}
+
+/// Strings, each followed by its NUL, one after another (`/proc/<pid>/cmdline`).
+fn joined(strings: &[&[u8]]) -> Vec<u8> {
+    let mut all = Vec::new();
+    for text in strings {
+        all.extend_from_slice(text);
+        all.push(0);
+    }
+    all
 }
 
 /// For a script (`#!interpreter [argument]` on its first line): the interpreter and the
@@ -282,6 +367,9 @@ fn load_elf(
         memory,
         entry: loaded.entry,
         stack_pointer,
+        executable: None,
+        arguments: Vec::new(),
+        environment: Vec::new(),
     })
 }
 
@@ -300,11 +388,16 @@ pub fn spawn(
         arguments,
         environment,
     )?;
-    let process = Process::new(0, 0, String::from(path), image.space.clone());
+    let process = Process::new(0, 0, 0, String::from(path), image.space.clone());
     *process.memory.lock() = image.memory;
     *process.files.lock() = files;
-    // A process started by the kernel leads its own group, as init does.
+    *process.executable.lock() = image.executable;
+    *process.arguments.lock() = image.arguments;
+    *process.environment.lock() = image.environment;
+    process.executed.store(true, Ordering::Relaxed);
+    // A process started by the kernel leads its own session and group, as init does.
     process.group.store(process.id, Ordering::Relaxed);
+    process.session.store(process.id, Ordering::Relaxed);
     let process = Arc::new(process);
     TABLE.lock().insert(process.id, process.clone());
     let task = sched::spawn_user(
@@ -328,7 +421,12 @@ pub fn set_init(process: &Process) {
 pub fn fork(parent: &Arc<Process>, context: &UserContext) -> Result<u32, Errno> {
     let space = Arc::new(parent.space()?.duplicate().ok_or(ENOMEM)?);
     let group = parent.group.load(Ordering::Relaxed);
-    let child = Process::new(parent.id, group, parent.name(), space.clone());
+    let session = parent.session.load(Ordering::Relaxed);
+    let child = Process::new(parent.id, group, session, parent.name(), space.clone());
+    *child.controlling_tty.lock() = parent.controlling_tty.lock().clone();
+    *child.executable.lock() = parent.executable.lock().clone();
+    *child.arguments.lock() = parent.arguments.lock().clone();
+    *child.environment.lock() = parent.environment.lock().clone();
     *child.memory.lock() = parent.memory.lock().clone();
     *child.files.lock() = parent.files.lock().clone();
     *child.cwd.lock() = parent.cwd.lock().clone();
@@ -361,6 +459,10 @@ pub fn exec(
     *process.memory.lock() = image.memory;
     *process.space.lock() = Some(image.space.clone());
     *process.name.lock() = String::from(path);
+    *process.executable.lock() = image.executable;
+    *process.arguments.lock() = image.arguments;
+    *process.environment.lock() = image.environment;
+    process.executed.store(true, Ordering::Relaxed);
     task::replace_space(image.space);
     task::set_fs_base(0).expect("0 is a user address");
     task::reset_fpu();
@@ -383,6 +485,12 @@ pub fn exit(process: Arc<Process>, exit: Exit) -> ! {
         panic!("init (process {id}) {exit}");
     }
     info!("process {id} ({}) {exit}", process.name());
+    // A session leader's exit hangs up its controlling terminal (`man 2 _exit`).
+    if process.session() == id
+        && let Some(tty) = controlling_tty(&process)
+    {
+        tty.disassociate(true);
+    }
     // Closing the files may wake others (a pipe's other end), so not under the lock.
     let files = core::mem::take(&mut *process.files.lock());
     drop(files);
@@ -393,14 +501,17 @@ pub fn exit(process: Arc<Process>, exit: Exit) -> ! {
     *process.exit.lock() = Some(exit);
 
     let init = INIT.load(Ordering::Relaxed);
+    let mut orphaned = Vec::new();
     let parent = {
         let mut table = TABLE.lock();
         let mut orphans_exited = false;
         let mut reaped = Vec::new();
+        let mut children = Vec::new();
         for (&child_id, child) in table.iter() {
             if child.parent() != id {
                 continue;
             }
+            children.push(child_id);
             child.parent.store(init, Ordering::Relaxed);
             if init == 0 {
                 child.orphan.store(true, Ordering::Relaxed);
@@ -417,6 +528,7 @@ pub fn exit(process: Arc<Process>, exit: Exit) -> ! {
         if orphans_exited && let Some(init) = table.get(&init) {
             init.children_changed.wake_all();
         }
+        hang_up_orphans(&table, &process, &children, &mut orphaned);
         let parent = table.get(&process.parent()).cloned();
         if parent
             .as_ref()
@@ -429,6 +541,12 @@ pub fn exit(process: Arc<Process>, exit: Exit) -> ! {
         }
         parent
     };
+    // Groups this exit orphaned, with stopped members: they would stay stopped forever, so
+    // they get `SIGHUP` (which usually ends them) and `SIGCONT` (POSIX, `man 2 _exit`).
+    for group in orphaned {
+        signal::send_to_group(group, signal::SIGHUP, signal::from_kernel());
+        signal::send_to_group(group, signal::SIGCONT, signal::from_kernel());
+    }
     match parent {
         Some(parent) => {
             signal::send(&parent, SIGCHLD, signal::child_info(id, exit));
@@ -449,14 +567,23 @@ pub enum Selector {
     Group(u32),
 }
 
-/// `wait4`: waits for a child of `process` that matches `selector` to exit, removes it from
-/// the table and returns its ID and how it ended. With `no_hang`, returns `None` at once if
-/// no child has exited. A signal ends the wait (`ERESTARTSYS`).
+/// What `wait4` reports besides exits (`WUNTRACED`, `WCONTINUED`).
+#[derive(Clone, Copy, Default)]
+pub struct WaitFor {
+    pub stopped: bool,
+    pub continued: bool,
+}
+
+/// `wait4`: waits for a child of `process` that matches `selector` to exit (or stop or
+/// continue, if `also` asks), and returns its ID and status word. An exited child is removed
+/// from the table. With `no_hang`, returns `None` at once if nothing happened. A signal ends
+/// the wait (`ERESTARTSYS`).
 pub fn wait(
     process: &Process,
     selector: Selector,
+    also: WaitFor,
     no_hang: bool,
-) -> Result<Option<(u32, Exit)>, Errno> {
+) -> Result<Option<(u32, u32)>, Errno> {
     process.children_changed.wait_interruptible(|| {
         let mut table = TABLE.lock();
         let matches = |child: &Process| {
@@ -468,26 +595,214 @@ pub fn wait(
                 }
         };
         let mut any = false;
-        let mut exited = None;
+        let mut found = None;
         for child in table.values() {
-            if matches(child) {
-                any = true;
-                if let Some(exit) = child.exit() {
-                    exited = Some((child.id, exit));
-                    break;
-                }
+            if !matches(child) {
+                continue;
             }
+            any = true;
+            if let Some(exit) = child.exit() {
+                found = Some((child.id, exit.wait_status(), true));
+                break;
+            }
+            let mut job = child.job.lock();
+            let status = match job.report {
+                // As the `W*` macros decode it: 0x7f marks "stopped", 0xffff "continued".
+                Some(Report::Stopped(signal)) if also.stopped => u32::from(signal) << 8 | 0x7f,
+                Some(Report::Continued) if also.continued => 0xffff,
+                _ => continue,
+            };
+            job.report = None;
+            found = Some((child.id, status, false));
+            break;
         }
-        match exited {
-            Some((id, exit)) => {
-                table.remove(&id);
-                Some(Ok(Some((id, exit))))
+        match found {
+            Some((id, status, exited)) => {
+                if exited {
+                    table.remove(&id);
+                }
+                Some(Ok(Some((id, status))))
             }
             None if !any => Some(Err(ECHILD)),
             None if no_hang => Some(Ok(None)),
             None => None,
         }
     })?
+}
+
+/// Stops the current process (a stop signal with the default action) until it is continued
+/// or killed. Its parent hears of it through `SIGCHLD` (unless `SA_NOCLDSTOP`) and `wait4`.
+pub fn stop(process: &Arc<Process>, signal: u8) {
+    {
+        let mut job = process.job.lock();
+        job.stopped = true;
+        job.report = Some(Report::Stopped(signal));
+    }
+    info!(
+        "process {} ({}) stopped by signal {signal}",
+        process.id,
+        process.name()
+    );
+    notify_parent(process, signal::child_stopped(process.id, Some(signal)));
+    // Not interruptible: other signals wait until `SIGCONT`; only `SIGKILL` ends a stop.
+    process.resumed.wait_until(|| {
+        let stopped = process.job.lock().stopped;
+        (!stopped || process.signals.lock().kill_pending()).then_some(())
+    });
+}
+
+/// `SIGCONT` was sent: a stopped process runs again, and its parent hears of it.
+pub fn resume(process: &Process) {
+    let was_stopped = {
+        let mut job = process.job.lock();
+        let was_stopped = job.stopped;
+        if was_stopped {
+            job.stopped = false;
+            job.report = Some(Report::Continued);
+        }
+        was_stopped
+    };
+    if was_stopped {
+        info!("process {} ({}) continued", process.id, process.name());
+        process.resumed.wake_all();
+        notify_parent(process, signal::child_stopped(process.id, None));
+    }
+}
+
+/// Tells the parent that `process` stopped or continued.
+fn notify_parent(process: &Process, info: signal::Info) {
+    let parent = TABLE.lock().get(&process.parent()).cloned();
+    if let Some(parent) = parent {
+        let quiet = parent.signals.lock().action(SIGCHLD).flags & signal::flags::SA_NOCLDSTOP;
+        if quiet == 0 {
+            signal::send(&parent, SIGCHLD, info);
+        }
+        parent.children_changed.wake_all();
+    }
+}
+
+/// Whether process group `group` is orphaned (or will be once process `ignore` is gone):
+/// no living member has a living parent in another group of the same session. Init does
+/// not count as such a parent (Linux's `will_become_orphaned_pgrp`).
+pub fn is_orphaned_group(group: u32, ignore: Option<u32>) -> bool {
+    orphaned_in(&TABLE.lock(), group, ignore)
+}
+
+fn orphaned_in(table: &BTreeMap<u32, Arc<Process>>, group: u32, ignore: Option<u32>) -> bool {
+    let init = INIT.load(Ordering::Relaxed);
+    !table.values().any(|member| {
+        Some(member.id) != ignore
+            && member.exit().is_none()
+            && member.group() == group
+            && member.parent() != init
+            && table.get(&member.parent()).is_some_and(|parent| {
+                parent.exit().is_none()
+                    && parent.group() != group
+                    && parent.session() == member.session()
+            })
+    })
+}
+
+fn has_stopped_members(table: &BTreeMap<u32, Arc<Process>>, group: u32) -> bool {
+    table.values().any(|member| {
+        member.group() == group && member.exit().is_none() && member.job.lock().stopped
+    })
+}
+
+/// The groups that `exiting`'s exit leaves orphaned with stopped members (Linux's
+/// `kill_orphaned_pgrp`): its own group, if its parent was that group's link to the
+/// session, and the groups of its children (already given to their new parent).
+fn hang_up_orphans(
+    table: &BTreeMap<u32, Arc<Process>>,
+    exiting: &Process,
+    children: &[u32],
+    groups: &mut Vec<u32>,
+) {
+    let mut candidates = Vec::new();
+    if let Some(parent) = table.get(&exiting.parent())
+        && parent.group() != exiting.group()
+        && parent.session() == exiting.session()
+        && orphaned_in(table, exiting.group(), Some(exiting.id))
+    {
+        candidates.push(exiting.group());
+    }
+    for child in children.iter().filter_map(|id| table.get(id)) {
+        if child.group() != exiting.group()
+            && child.session() == exiting.session()
+            && orphaned_in(table, child.group(), None)
+        {
+            candidates.push(child.group());
+        }
+    }
+    for group in candidates {
+        if !groups.contains(&group) && has_stopped_members(table, group) {
+            groups.push(group);
+        }
+    }
+}
+
+/// The controlling terminal of `process`, if it has one that still belongs to its session.
+pub fn controlling_tty(process: &Process) -> Option<Arc<Tty>> {
+    let tty = process.controlling_tty.lock().clone()?;
+    (tty.session() == Some(process.session())).then_some(tty)
+}
+
+/// The process with ID `id` (zombies too).
+pub fn find(id: u32) -> Option<Arc<Process>> {
+    TABLE.lock().get(&id).cloned()
+}
+
+/// `setsid`: `process` starts a new session and group, both with its own ID, without a
+/// controlling terminal. `EPERM` if it already leads a group (its ID would then name two
+/// groups).
+pub fn new_session(process: &Process) -> Result<u32, Errno> {
+    let table = TABLE.lock();
+    if table.values().any(|other| other.group() == process.id) {
+        return Err(EPERM);
+    }
+    process.group.store(process.id, Ordering::Relaxed);
+    process.session.store(process.id, Ordering::Relaxed);
+    *process.controlling_tty.lock() = None;
+    Ok(process.id)
+}
+
+/// `setpgid(pid, pgid)` with both already defaulted, as Linux checks it: the target is the
+/// caller or a child of it that has not called `execve`, in the same session and not a
+/// session leader; the group is its own ID or an existing group of the session.
+pub fn set_group(caller: &Process, target: u32, group: u32) -> Result<(), Errno> {
+    let table = TABLE.lock();
+    let process = table.get(&target).ok_or(ESRCH)?;
+    if process.id != caller.id {
+        if process.parent() != caller.id {
+            return Err(ESRCH);
+        }
+        if process.session() != caller.session() {
+            return Err(EPERM);
+        }
+        if process.executed.load(Ordering::Relaxed) {
+            return Err(EACCES);
+        }
+    }
+    if process.session() == process.id {
+        return Err(EPERM);
+    }
+    if group != process.id
+        && !table
+            .values()
+            .any(|other| other.group() == group && other.session() == caller.session())
+    {
+        return Err(EPERM);
+    }
+    process.group.store(group, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Whether any process in session `session` leads or belongs to group `group`.
+pub fn group_in_session(group: u32, session: u32) -> Option<bool> {
+    let table = TABLE.lock();
+    let mut members = table.values().filter(|other| other.group() == group);
+    let first = members.next()?;
+    Some(first.session() == session || members.any(|other| other.session() == session))
 }
 
 /// The process group of `process`, for `wait4(0, …)`.

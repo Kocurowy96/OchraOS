@@ -63,6 +63,9 @@ impl Dentry {
     }
 
     fn cached(&self, name: &str) -> Option<Arc<Dentry>> {
+        if !self.inode.caches_lookups() {
+            return None;
+        }
         self.children.lock().get(name).and_then(Weak::upgrade)
     }
 
@@ -121,6 +124,10 @@ impl Dentry {
 pub struct Mount {
     /// The filesystem's root directory.
     pub root: Arc<Dentry>,
+    /// The filesystem type (`tmpfs`, `proc`…), and what was mounted (Linux's "source"), for
+    /// `/proc/mounts`.
+    pub kind: &'static str,
+    pub source: &'static str,
     /// Where it is attached: the parent mount and the dentry there (`None` for `/`).
     mountpoint: Option<(Arc<Mount>, Arc<Dentry>)>,
 }
@@ -140,9 +147,11 @@ pub struct Path {
 }
 
 /// Makes a filesystem with root directory `inode` the root of the tree.
-pub(super) fn set_root(inode: InodeRef) {
+pub(super) fn set_root(inode: InodeRef, kind: &'static str) {
     let mount = Arc::new(Mount {
         root: Dentry::new("/", None, inode),
+        kind,
+        source: kind,
         mountpoint: None,
     });
     *ROOT.lock() = Some(Path {
@@ -156,17 +165,37 @@ pub fn root() -> Path {
     ROOT.lock().clone().expect("the root is mounted at boot")
 }
 
-/// Mounts the filesystem with root directory `inode` on the directory `at`.
-pub fn mount(at: &Path, inode: InodeRef) -> Result<(), Errno> {
+/// Mounts the filesystem of type `kind` with root directory `inode` on the directory `at`.
+pub fn mount(at: &Path, inode: InodeRef, kind: &'static str) -> Result<(), Errno> {
     if !at.metadata().is_directory() {
         return Err(ENOTDIR);
     }
     let mount = Arc::new(Mount {
         root: Dentry::new("/", None, inode),
+        kind,
+        source: kind,
         mountpoint: Some((at.mount.clone(), at.dentry.clone())),
     });
     MOUNTS.lock().push(mount);
     Ok(())
+}
+
+/// Every mount, `/` first, in mount order: the filesystem type, the source and where it is
+/// (`/proc/mounts`).
+pub fn mounts() -> Vec<(&'static str, &'static str, String)> {
+    let root = root();
+    let mut all = alloc::vec![(root.mount.kind, root.mount.source, String::from("/"))];
+    let mounts = MOUNTS.lock().clone();
+    for mount in mounts {
+        let at = Path {
+            dentry: mount.root.clone(),
+            mount: mount.clone(),
+        };
+        if let Ok(name) = at.absolute_name() {
+            all.push((mount.kind, mount.source, name));
+        }
+    }
+    all
 }
 
 /// The mount attached at `path`, if any.
@@ -521,10 +550,10 @@ fn walk_components(
             if target.is_empty() {
                 return Err(ENOENT);
             }
-            let mut more = components(&target)?;
-            // An empty list (the target is `/`) leaves us at the root.
-            more.append(&mut parts);
-            parts = more;
+            // The target's components go on top of the rest (both are kept last first),
+            // so they are walked before it. An empty list (the target is `/`) leaves us at
+            // the root.
+            parts.append(&mut components(&target)?);
             if target.starts_with('/') {
                 current = root();
             }

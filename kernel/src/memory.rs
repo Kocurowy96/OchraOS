@@ -139,6 +139,15 @@ impl Areas {
     }
 }
 
+/// A run of pages with the same access, for `/proc/<pid>/maps`.
+pub struct Region {
+    pub start: u64,
+    pub end: u64,
+    pub access: UserAccess,
+    /// `[heap]`, `[stack]`, or empty.
+    pub name: &'static str,
+}
+
 /// `Clone` for `fork`: the child gets the same layout (its pages are copied separately).
 #[derive(Clone)]
 pub struct Memory {
@@ -164,6 +173,44 @@ impl Memory {
             stack_limit: 0,
             stack_bottom: 0,
         }
+    }
+
+    /// The memory in use as runs of mapped pages with equal access (`/proc/<pid>/maps`).
+    /// Linux lists the areas as they were made; this reads the page tables, so neighbouring
+    /// areas with the same access show as one, and pages not mapped yet (the stack's room
+    /// to grow, the guard gap) do not show.
+    pub fn regions(&self, space: &UserSpace) -> alloc::vec::Vec<Region> {
+        let heap = self.brk_start..page_up(self.brk).unwrap_or(self.brk);
+        let stack = self.stack_limit..self.areas.0.values().copied().max().unwrap_or(0);
+        let mut regions: alloc::vec::Vec<Region> = alloc::vec::Vec::new();
+        for (&start, &end) in &self.areas.0 {
+            for page in (start..end).step_by(FRAME_SIZE as usize) {
+                let Some((_, access)) = space.translate(page) else {
+                    continue;
+                };
+                let name = if heap.contains(&page) {
+                    "[heap]"
+                } else if self.stack_limit != 0 && stack.contains(&page) {
+                    "[stack]"
+                } else {
+                    ""
+                };
+                match regions.last_mut() {
+                    Some(last)
+                        if last.end == page && last.access == access && last.name == name =>
+                    {
+                        last.end = page + FRAME_SIZE;
+                    }
+                    _ => regions.push(Region {
+                        start: page,
+                        end: page + FRAME_SIZE,
+                        access,
+                        name,
+                    }),
+                }
+            }
+        }
+        regions
     }
 
     /// Reserves `start..end` (page-aligned) and fills it with zeroed pages.

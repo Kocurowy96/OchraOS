@@ -29,6 +29,11 @@ pub fn init(cpus: u32) {
     TICKS.lock().resize(cpus as usize, 0);
 }
 
+/// How many CPUs run (`/sys/devices/system/cpu/online`, `/proc/cpuinfo`).
+pub fn cpus() -> u32 {
+    TICKS.lock().len() as u32
+}
+
 /// Timer interrupts on the boot CPU since its timer was started.
 pub fn ticks() -> u64 {
     ticks_on(0)
@@ -47,7 +52,7 @@ pub fn on_tick(_vector: u8) {
     // Keyboard input on the serial console, polled by one CPU (decisions.md); sleepers
     // check their deadline.
     if cpu_index() == 0 {
-        crate::console::poll();
+        crate::tty::poll_serial();
         SLEEPERS.wake_all();
     }
     // The time slice of the running task is over.
@@ -111,6 +116,12 @@ pub fn realtime() -> u64 {
 /// Whether the monotonic clock has nanosecond steps (TSC) rather than ticks.
 pub fn precise() -> bool {
     TSC_AT_BOOT.load(Ordering::Relaxed) != 0
+}
+
+/// The queue woken on every tick: wait in it (with others, `sched::wait_any`) to notice a
+/// deadline.
+pub fn ticks_queue() -> &'static WaitQueue {
+    &SLEEPERS
 }
 
 /// Sleeps until the monotonic clock reaches `deadline`; gives up with `ERESTARTSYS` when a

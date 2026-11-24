@@ -118,7 +118,9 @@ Rules that prevent deadlocks:
   Linux's rootfs), so the root is writable from the start;
 - `/tmp` is a tmpfs with mode 1777 (sticky, writable by all);
 - a devtmpfs is mounted at `/dev` with `null`, `zero`, `full`, `random`, `urandom`,
-  `console` and `tty`;
+  `console`, `tty`, `ptmx` and `ttyS0`, and devpts at `/dev/pts`;
+- until `mount(2)` exists (P4), the kernel also mounts procfs at `/proc` and sysfs at
+  `/sys`;
 - in P4 the kernel mounts the disk given by `root=` (ext4) and starts `/sbin/init` or the
   `init=` program from there; with an initramfs, `/init` can still mount it itself
   (`switch_root`).
@@ -161,7 +163,8 @@ and what is still missing:
   to date" flag; the "dirty" flag is set but not used until writeback (P4).
 - **`/dev`** is a plain tmpfs in which the kernel creates the device nodes at boot (no
   separate devtmpfs). A device opened through its node is a `DeviceNode`: reads and writes go
-  to the device, `fstat`/`fchmod`/`fchown` to the node. `/dev/tty` is the console for now.
+  to the device, `fstat`/`fchmod`/`fchown` to the node. `/dev/tty` is the caller's
+  controlling terminal (since P2).
 - **`chown`** follows Linux rather than "root only": an owner may also change the group to one
   of its own groups. It clears set-user-ID (and set-group-ID if the group may execute), as
   Linux does.
@@ -171,6 +174,22 @@ and what is still missing:
   `O_APPEND` with `fcntl(F_SETFL)`; `RENAME_EXCHANGE`; `statx`; `noexec`; file locks.
 - `relatime` is implemented but not compared with the host in the tests: the result depends
   on the host's mount options (the owner's `/tmp` is `noatime`).
+
+## As built in P2
+
+- **Synthetic filesystems** (`kernel/src/fs/synthetic.rs`): procfs, sysfs and devpts store
+  nothing. A directory is a `Listing` that makes its entries when listed or looked up (with
+  stable cookies: fixed entries in order, then e.g. `1000 + pid` in `/proc`); a file's
+  contents are made when it is opened (as Linux's `seq_file` on the first read), so one
+  open file reads one consistent snapshot; files report size 0 and refuse every change
+  (`EPERM`). `Inode::open` lets such a filesystem make its own open files; the VFS asks it
+  before the usual regular-file and device paths.
+- **No dentry cache for them**: a directory can say its entries must not be cached
+  (`Inode::caches_lookups`, Linux's `d_revalidate`), so a walk always asks it again; a
+  closed pty or a reaped process is gone at once even while an old path to it is in use.
+- **Mounts** record their kind and source (`/proc/mounts`); there are no mount options yet.
+- **`/proc`** (`kernel/src/fs/procfs.rs`): see the deviations in `docs/decisions.md`
+  (2026-11-24) and the access rules in `docs/security.md`.
 
 ## Not in stage 3
 

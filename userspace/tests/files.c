@@ -202,6 +202,11 @@ int main(void) {
            size_of("s"));
     report("stat s follows", stat("s", &info));
     check("s is a regular file", S_ISREG(info.st_mode));
+    // A link in the middle of a path: the walk goes on inside its target.
+    report("symlink dl -> d", symlink("d", "dl"));
+    report("stat dl/h", stat("dl/h", &info));
+    check("dl/h is a regular file", S_ISREG(info.st_mode));
+    report("stat dl/../d/h", stat("dl/../d/h", &info));
     report("readlink a regular file", readlink("a", target, sizeof target));
     report("symlink loop", symlink("loop", "loop"));
     report("open the loop", open("loop", O_RDONLY));
@@ -289,6 +294,7 @@ int main(void) {
     report("unlink b", unlink("b"));
     report("unlink s", unlink("s"));
     report("unlink loop", unlink("loop"));
+    report("unlink dl", unlink("dl"));
     report("unlink m", unlink("m"));
     report("rmdir d", rmdir("d"));
     report("rmdir f", rmdir("f"));

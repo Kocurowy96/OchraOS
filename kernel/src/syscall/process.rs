@@ -10,7 +10,7 @@ use ochra_frame::user_mode::UserContext;
 use ochra_frame::{random, task};
 
 use super::{SyscallResult, current, read_string, read_u64, write_user};
-use crate::errno::{E2BIG, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOSYS, EPERM, Errno};
+use crate::errno::{E2BIG, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOSYS, EPERM, ESRCH, Errno};
 use crate::memory::STACK_LIMIT;
 use crate::process::{self, Exit, Selector};
 
@@ -95,7 +95,7 @@ pub fn exit(status: i32) -> SyscallResult {
 /// `wait4(pid, wstatus, options, rusage)`.
 pub fn wait4(pid: i64, status: u64, options: u64, usage: u64) -> SyscallResult {
     const WNOHANG: u64 = 1;
-    // Accepted, but there are no stopped or continued children yet (signals, P4).
+    /// Also report children that stopped, and that continued.
     const WUNTRACED: u64 = 2;
     const WCONTINUED: u64 = 8;
     // Thread-related, meaningless while processes have one thread.
@@ -114,11 +114,16 @@ pub fn wait4(pid: i64, status: u64, options: u64, usage: u64) -> SyscallResult {
         pid if pid < -1 => Selector::Group(pid.unsigned_abs() as u32),
         pid => Selector::Process(pid as u32),
     };
-    let Some((child, exit)) = process::wait(&process, selector, options & WNOHANG != 0)? else {
+    let also = process::WaitFor {
+        stopped: options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
+    };
+    let Some((child, word)) = process::wait(&process, selector, also, options & WNOHANG != 0)?
+    else {
         return Ok(0);
     };
     if status != 0 {
-        write_user(status, &exit.wait_status().to_le_bytes())?;
+        write_user(status, &word.to_le_bytes())?;
     }
     if usage != 0 {
         // No resource accounting yet: all zero.
@@ -149,6 +154,54 @@ pub fn identity(number: u64) -> SyscallResult {
         _ => credentials.effective_group,
     };
     Ok(u64::from(id))
+}
+
+/// `setsid()`: a new session and group led by the caller; returns the session ID.
+pub fn setsid() -> SyscallResult {
+    let process = current()?;
+    Ok(u64::from(process::new_session(&process)?))
+}
+
+/// `setpgid(pid, pgid)`: 0 for `pid` means the caller, 0 for `pgid` means `pid`.
+pub fn setpgid(pid: u64, pgid: u64) -> SyscallResult {
+    let process = current()?;
+    // As Linux: pid 0 is the caller, group 0 is the same as the pid; then a negative group
+    // (also from a negative pid) is `EINVAL`.
+    let pid = match pid as i32 {
+        0 => process.id as i32,
+        pid => pid,
+    };
+    let pgid = match pgid as i32 {
+        0 => pid,
+        pgid => pgid,
+    };
+    if pgid < 0 {
+        return Err(EINVAL);
+    }
+    if pid < 0 {
+        return Err(ESRCH);
+    }
+    process::set_group(&process, pid as u32, pgid as u32)?;
+    Ok(0)
+}
+
+/// The process `pid` names for `getpgid`/`getsid`: 0 is the caller.
+fn named(pid: u64) -> Result<alloc::sync::Arc<crate::process::Process>, Errno> {
+    let pid = pid as i32;
+    if pid == 0 {
+        return current();
+    }
+    u32::try_from(pid).ok().and_then(process::find).ok_or(ESRCH)
+}
+
+/// `getpgid(pid)`.
+pub fn getpgid(pid: u64) -> SyscallResult {
+    Ok(u64::from(named(pid)?.group()))
+}
+
+/// `getsid(pid)`.
+pub fn getsid(pid: u64) -> SyscallResult {
+    Ok(u64::from(named(pid)?.session()))
 }
 
 /// `getpgrp()`.

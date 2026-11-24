@@ -22,7 +22,7 @@ use alloc::sync::Arc;
 pub use file::{DeviceNode, VfsFile, touch_accessed, truncate};
 pub use inode::{DirectoryEntry, Inode, Metadata, NewNode, Timestamp};
 pub use page_cache::PageCache;
-pub use path::{PATH_MAX, Parent, Path, Walk, mount, rename, root};
+pub use path::{PATH_MAX, Parent, Path, Walk, mount, mounts, rename, root};
 pub use permission::{Access, Credentials, may_access, may_delete, may_own};
 
 use crate::fs::tmpfs;
@@ -55,7 +55,7 @@ pub fn anonymous_device() -> u64 {
 /// Mounts the root tmpfs, unpacks `initramfs` into it, then mounts `/dev` (with the device
 /// nodes) and `/tmp`. Call once at boot, before any process starts.
 pub fn init(initramfs: &'static [u8]) {
-    path::set_root(tmpfs::new(0o755));
+    path::set_root(tmpfs::new(0o755), "tmpfs");
     match crate::initramfs::unpack(initramfs, &root()) {
         Ok(count) => log::info!(
             "vfs: root is a tmpfs, {count} initramfs entries ({} KiB) unpacked into it",
@@ -64,19 +64,31 @@ pub fn init(initramfs: &'static [u8]) {
         Err(error) => log::error!("vfs: unpacking the initramfs failed (errno {error})"),
     }
     let credentials = Credentials::root();
-    for (name, permissions) in [("dev", 0o755), ("tmp", 0o1777)] {
-        let at = match root().walk(name, Walk::Follow, &credentials) {
+    let mount_at = |path: &str, inode: InodeRef, kind: &'static str| {
+        let at = match root().walk(path, Walk::Follow, &credentials) {
             Ok(at) => at,
-            Err(_) => root()
-                .create(name, NewNode::Directory, 0o755, &credentials)
-                .expect("the root tmpfs takes new directories"),
+            Err(_) => {
+                let parent = root()
+                    .walk_parent(path, &credentials)
+                    .expect("mount points are below existing directories");
+                parent
+                    .directory
+                    .create(&parent.name, NewNode::Directory, 0o755, &credentials)
+                    .expect("the root tmpfs takes new directories")
+            }
         };
-        mount(&at, tmpfs::new(permissions)).expect("a tmpfs mounts on a directory");
-    }
+        mount(&at, inode, kind).expect("filesystems mount on directories");
+    };
+    mount_at("dev", tmpfs::new(0o755), "tmpfs");
     let dev = root()
         .walk("dev", Walk::Follow, &credentials)
         .expect("/dev was just mounted");
     crate::file::create_device_nodes(&dev);
+    mount_at("dev/pts", crate::tty::devpts_root(), "devpts");
+    mount_at("tmp", tmpfs::new(0o1777), "tmpfs");
+    // Until `mount(2)` exists (P4), the kernel mounts these itself (docs/decisions.md).
+    mount_at("proc", crate::fs::procfs::root(), "proc");
+    mount_at("sys", crate::fs::sysfs::root(), "sysfs");
 }
 
 /// An inode behind an `Arc`.

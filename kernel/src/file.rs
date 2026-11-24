@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use ochra_frame::sync::IrqMutex;
 
-use crate::errno::{EAGAIN, EBADF, EINVAL, EMFILE, ENOSPC, ENOTDIR, ENXIO, EPIPE, ESPIPE, Errno};
+use crate::errno::{EAGAIN, EBADF, EINVAL, EMFILE, ENOSPC, ENOTDIR, ENOTTY, EPIPE, ESPIPE, Errno};
 use crate::sched::WaitQueue;
 use crate::vfs::{Credentials, Metadata, NewNode, Path, Timestamp, mode};
 
@@ -47,10 +47,20 @@ pub trait File: Send + Sync {
     /// `O_RDONLY`, `O_WRONLY` or `O_RDWR`.
     fn access_mode(&self) -> u32;
 
-    /// Whether this is a terminal (answers terminal `ioctl`s).
-    fn is_terminal(&self) -> bool {
-        false
+    /// An `ioctl` the syscall layer does not answer itself; `ENOTTY` ("not a terminal": the
+    /// request does not apply to this kind of file) by default.
+    fn ioctl(&self, _request: u64, _argument: u64) -> Result<u64, Errno> {
+        Err(ENOTTY)
     }
+
+    /// What `poll` would report now (`events::*`). Files that never block (regular files,
+    /// `/dev/null`) are always readable and writable.
+    fn poll(&self) -> u32 {
+        events::IN | events::RDNORM | events::OUT | events::WRNORM
+    }
+
+    /// The queues woken when [`poll`](Self::poll)'s answer may change.
+    fn wait_queues<'a>(&'a self, _queues: &mut Vec<&'a WaitQueue>) {}
 
     /// Whether writes go to the end of the file (`O_APPEND`).
     fn append(&self) -> bool {
@@ -97,6 +107,18 @@ pub trait File: Send + Sync {
     }
 }
 
+/// `poll` events (`include/uapi/asm-generic/poll.h`).
+pub mod events {
+    pub const IN: u32 = 0x1;
+    pub const PRI: u32 = 0x2;
+    pub const OUT: u32 = 0x4;
+    pub const ERR: u32 = 0x8;
+    pub const HUP: u32 = 0x10;
+    pub const NVAL: u32 = 0x20;
+    pub const RDNORM: u32 = 0x40;
+    pub const WRNORM: u32 = 0x100;
+}
+
 /// The metadata of a file that is not in any filesystem (a pipe, the console before
 /// `/dev` existed): only what is given, the rest zero.
 pub fn anonymous_metadata(mode: u32, rdev: u64, device: u64, inode: u64) -> Metadata {
@@ -111,16 +133,15 @@ pub fn anonymous_metadata(mode: u32, rdev: u64, device: u64, inode: u64) -> Meta
 }
 
 /// The device a character device node stands for, by its number (Linux's numbers,
-/// `Documentation/admin-guide/devices.txt`); `ENXIO` for one that does not exist.
-pub fn open_device(rdev: u64) -> Result<Arc<dyn File>, Errno> {
-    match (rdev >> 8, rdev & 0xff) {
+/// `Documentation/admin-guide/devices.txt`), opened with `open_flags`; `ENXIO` for one that
+/// does not exist.
+pub fn open_device(rdev: u64, open_flags: u32) -> Result<Arc<dyn File>, Errno> {
+    match major_minor(rdev) {
         (1, 3) => Ok(Arc::new(Null)),
         (1, 5) => Ok(Arc::new(Zero { full: false })),
         (1, 7) => Ok(Arc::new(Zero { full: true })),
         (1, 8 | 9) => Ok(Arc::new(Random)),
-        // `/dev/tty` is the process's controlling terminal: the console, the only one.
-        (5, 0 | 1) => Ok(Arc::new(crate::console::Console)),
-        _ => Err(ENXIO),
+        (major, minor) => crate::tty::open_device(major, minor, open_flags),
     }
 }
 
@@ -135,6 +156,8 @@ pub fn create_device_nodes(dev: &Path) {
         ("urandom", device(1, 9), 0o666),
         ("tty", device(5, 0), 0o666),
         ("console", device(5, 1), 0o600),
+        ("ptmx", device(5, 2), 0o666),
+        ("ttyS0", device(4, 64), 0o660),
     ];
     for (name, rdev, permissions) in nodes {
         if let Err(error) = dev.create(
@@ -151,9 +174,17 @@ pub fn create_device_nodes(dev: &Path) {
 /// The device number (`st_dev`) of the internal filesystem of pipes, as Linux's pipefs.
 pub const PIPE_DEVICE: u64 = 0x0d;
 
-/// A device number from its major and minor numbers (`makedev`, small numbers only).
+/// A device number from its major and minor numbers, as glibc's `makedev` packs them: the
+/// low 8 bits of the minor, 12 bits of the major, then the rest of the minor and the major.
 pub const fn device(major: u64, minor: u64) -> u64 {
-    major << 8 | minor
+    (minor & 0xff) | (major & 0xfff) << 8 | (minor & !0xff) << 12 | (major & !0xfff) << 32
+}
+
+/// The major and minor numbers of a device number (`major()`, `minor()`).
+pub const fn major_minor(device: u64) -> (u64, u64) {
+    let major = (device >> 8) & 0xfff | (device >> 32) & !0xfff;
+    let minor = device & 0xff | (device >> 12) & !0xff;
+    (major, minor)
 }
 
 /// One opening of a file.
@@ -260,6 +291,14 @@ impl FdTable {
             .and_then(|fd| self.slots.get_mut(fd))
             .and_then(Option::take)
             .ok_or(EBADF)
+    }
+
+    /// The open descriptors, by number.
+    pub fn descriptors(&self) -> impl Iterator<Item = (u64, &Descriptor)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, slot)| Some((fd as u64, slot.as_ref()?)))
     }
 
     /// Removes the descriptors marked close-on-exec (for `execve`) and returns them.
@@ -495,6 +534,18 @@ impl File for PipeEnd {
         }
     }
 
+    fn poll(&self) -> u32 {
+        self.events()
+    }
+
+    fn wait_queues<'a>(&'a self, queues: &mut Vec<&'a WaitQueue>) {
+        queues.push(if self.writer {
+            &self.pipe.writable
+        } else {
+            &self.pipe.readable
+        });
+    }
+
     fn stat(&self) -> Metadata {
         // One number per pipe, as Linux's pipefs gives each its own inode.
         let inode = Arc::as_ptr(&self.pipe) as u64;
@@ -503,6 +554,32 @@ impl File for PipeEnd {
         metadata.modified = self.pipe.created;
         metadata.changed = self.pipe.created;
         metadata
+    }
+}
+
+impl PipeEnd {
+    /// `poll` for a pipe end, as Linux's `pipe_poll`: the read end is readable with data and
+    /// hung up without writers; the write end is writable with room for an atomic write and
+    /// in error without readers.
+    fn events(&self) -> u32 {
+        let state = self.pipe.state.lock();
+        let mut ready = 0;
+        if self.writer {
+            if PIPE_CAPACITY - state.buffer.len() >= PIPE_BUF {
+                ready |= events::OUT | events::WRNORM;
+            }
+            if state.readers == 0 {
+                ready |= events::ERR;
+            }
+        } else {
+            if !state.buffer.is_empty() {
+                ready |= events::IN | events::RDNORM;
+            }
+            if state.writers == 0 {
+                ready |= events::HUP;
+            }
+        }
+        ready
     }
 }
 

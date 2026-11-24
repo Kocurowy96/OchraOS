@@ -9,6 +9,7 @@ pub const EPERM: Errno = 1;
 pub const ENOENT: Errno = 2;
 pub const ESRCH: Errno = 3;
 pub const EINTR: Errno = 4;
+pub const EIO: Errno = 5;
 pub const ENXIO: Errno = 6;
 pub const E2BIG: Errno = 7;
 pub const ENOEXEC: Errno = 8;
@@ -47,3 +48,6 @@ pub const ERESTARTSYS: Errno = 512;
 pub const ERESTARTNOINTR: Errno = 513;
 /// Restart only if no handler runs; else `EINTR` (`pause`, `rt_sigsuspend`).
 pub const ERESTARTNOHAND: Errno = 514;
+/// Restart through `restart_syscall` (which goes on from what the syscall saved in
+/// `Signals::restart_block`, e.g. a sleep's deadline) if no handler runs; else `EINTR`.
+pub const ERESTART_RESTARTBLOCK: Errno = 516;

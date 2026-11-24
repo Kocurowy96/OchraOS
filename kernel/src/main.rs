@@ -16,7 +16,6 @@
 extern crate alloc;
 
 mod banner;
-mod console;
 mod elf;
 mod errno;
 mod file;
@@ -30,6 +29,7 @@ mod selftest;
 mod signal;
 mod syscall;
 mod time;
+mod tty;
 mod vfs;
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -107,6 +107,7 @@ fn main(boot: &'static BootInfo) -> ! {
     if boot.initramfs().is_none() {
         log::warn!("initramfs: none loaded");
     }
+    tty::init();
     vfs::init(boot.initramfs().unwrap_or(&[]));
     interrupts::enable();
 
@@ -151,7 +152,7 @@ fn start_init(command_line: &str) {
         .unwrap_or("/init");
     // Descriptors 0, 1 and 2 share one opening of the console, as after Linux opens
     // `/dev/console` for init.
-    let console = file::OpenFile::new(alloc::sync::Arc::new(console::Console), 0);
+    let console = file::OpenFile::new(tty::console_file(), 0);
     let mut files = file::FdTable::default();
     for fd in 0..3 {
         let descriptor = file::Descriptor {

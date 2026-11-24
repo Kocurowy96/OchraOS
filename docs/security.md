@@ -41,6 +41,17 @@ Security is priority number one.
   OchraOS runs on a CPU affected by Meltdown (e.g. Haswell, as in the ThinkPad T440p), the
   kernel needs KPTI (separate user page tables without the kernel), switched off when
   `IA32_ARCH_CAPABILITIES` reports `RDCL_NO`. Not implemented yet.
+- **No `TIOCSTI`:** the ioctl that pushes characters into a terminal's input, as if typed,
+  is not implemented and always fails with `EIO` (what Linux 6.2+ answers when
+  `dev.tty.legacy_tiocsti` is 0). A program that can write to a terminal must not be able to
+  type commands into the shell that reads it.
+- **`/proc` of other processes:** `/proc/<pid>/environ`, `fd/` and `maps` of another process
+  are shown only after a check modelled on Linux's `ptrace_may_access` (same user and no
+  set-ID transition, or root), even while every process runs as root, so the check is in
+  place when users come.
+- **No kernel addresses in `/proc`:** fields that would show them are always 0, as in Linux
+  (`kstkeip`, `kstkesp`, `wchan` in `stat`); nothing in `/proc` or `/sys` reveals where the
+  kernel lies (KASLR).
 - **Firewall:** at first no service listens externally; nftables compatibility later.
 
 ## Ochra Guard

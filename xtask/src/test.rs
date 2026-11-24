@@ -55,6 +55,7 @@ const BOOT: &[&str] = &[
     "self-test interrupts: ok",
     "self-test timer: ok",
     "self-test user space: ok",
+    "self-test terminal: ok",
     "breakpoint (int3) at",
 ];
 
@@ -81,13 +82,24 @@ const CASES: &[Case] = &[
             "init: /tmp holds 2 entries again",
             "init: checks done",
             "init: starting a shell",
-            "shell got 42",
+            // Job control on the console: Ctrl-C, Ctrl-Z, jobs, fg.
+            "sleeping 42",
+            "interrupted 130",
+            "stopping 42",
+            "Stopped",
+            "listed 2",
+            // The continued job slept on until Ctrl-C (130: killed by SIGINT).
+            "shell got 42 after 130",
             "init: the shell exited with status 3",
             "init: starting a shell",
         ],
         anywhere: &[
             // `yes`, ended by SIGPIPE when `head` is done (the kernel logs it).
             "(/bin/yes) killed by signal 13",
+            // The jobs typed into the interactive shell.
+            "(/bin/sleep) killed by signal 2",
+            "(/bin/sleep) stopped by signal 20",
+            "(/bin/sleep) continued",
             "smp: 4 CPUs",
             "cpu 1 online",
             "cpu 2 online",
@@ -267,22 +279,86 @@ const FORBIDDEN: &[&str] = &["KERNEL PANIC", "CPU EXCEPTION", "ERROR"];
 /// After one of these lines the kernel prints nothing more (except, for a panic, the message).
 const FINAL_LINES: &[&str] = &["idling", "system halted", "KERNEL PANIC"];
 
-/// Keys typed on the serial console during a boot (as if on a terminal), once `after`
-/// appears; that boot is complete only when every line in `until` has appeared (or on a
-/// crash), since `/init` keeps running after the kernel reports "idling".
+/// Keys typed on the serial console during a boot (as if on a terminal), step by step; that
+/// boot is complete only when every line in `until` has appeared (or on a crash), since
+/// `/init` keeps running after the kernel reports "idling".
 struct Typing {
     case: &'static str,
-    after: &'static str,
-    keys: &'static str,
+    steps: &'static [Keys],
     until: &'static [&'static str],
 }
 
+/// One step: `keys` are typed once a line containing `after` appears (after the previous
+/// step was typed) and `delay` has passed. The delay gives the shell time to hand the
+/// terminal to a job (or take it back): a Ctrl-C typed while the shell's line editor still
+/// has the terminal in raw mode would be read as a character, not become a signal.
+struct Keys {
+    after: &'static str,
+    delay: Duration,
+    keys: &'static str,
+}
+
+const NOW: Duration = Duration::ZERO;
+const SETTLE: Duration = Duration::from_millis(1500);
+
+/// A job that says it runs, then sleeps in the foreground (`exec`, so the job's process is
+/// `sleep` itself). The arithmetic makes the job's line differ from the typed command.
+const SLEEPING_JOB: &str = "sh -c 'echo sleeping $((6*7)); exec sleep 100'\r";
+const STOPPING_JOB: &str = "sh -c 'echo stopping $((6*7)); exec sleep 100'\r";
+
 const TYPING: &[Typing] = &[Typing {
     case: "boot",
-    after: "init: starting a shell",
-    // Two commands for the interactive shell; Enter sends a carriage return, as on a real
-    // terminal. The console holds the keys until the shell reads them.
-    keys: "echo shell got $((6 * 7))\rexit 3\r",
+    // Enter sends a carriage return, as on a real terminal. Ctrl-C is 0x03, Ctrl-Z 0x1a.
+    steps: &[
+        Keys {
+            after: "init: starting a shell",
+            delay: NOW,
+            keys: SLEEPING_JOB,
+        },
+        Keys {
+            after: "sleeping 42",
+            delay: SETTLE,
+            keys: "\x03",
+        },
+        // The terminal echoes ^C; the shell ends the line.
+        Keys {
+            after: "^C",
+            delay: SETTLE,
+            keys: "echo interrupted $?\r",
+        },
+        Keys {
+            after: "interrupted 130",
+            delay: NOW,
+            keys: STOPPING_JOB,
+        },
+        Keys {
+            after: "stopping 42",
+            delay: SETTLE,
+            keys: "\x1a",
+        },
+        // ash reports the job as "[1]+  Stopped  sh -c ...".
+        Keys {
+            after: "Stopped",
+            delay: SETTLE,
+            keys: "jobs; echo listed $((1+1))\r",
+        },
+        Keys {
+            after: "listed 2",
+            delay: NOW,
+            keys: "fg\r",
+        },
+        // `fg` prints the job's command, then gives it the terminal and continues it.
+        Keys {
+            after: "exec sleep 100",
+            delay: SETTLE,
+            keys: "\x03",
+        },
+        Keys {
+            after: "^C",
+            delay: SETTLE,
+            keys: "echo shell got $((6 * 7)) after $?\rexit 3\r",
+        },
+    ],
     until: &["init: the shell exited with status 3", "idling"],
 }];
 
@@ -519,7 +595,7 @@ fn boot(image: &Path, extra_args: &[&str], typing: Option<&Typing>) -> Result<(S
 }
 
 /// Collects lines until the kernel is done, QEMU exits, or the timeout runs out; types the
-/// keys of `typing` on the console when its line appears.
+/// keys of each step of `typing` on the console when its line appears.
 fn collect(
     lines: &mpsc::Receiver<String>,
     typing: Option<&Typing>,
@@ -528,7 +604,7 @@ fn collect(
     let mut log = String::new();
     let deadline = Instant::now() + BOOT_TIMEOUT;
     let mut finished = false;
-    let mut typed = false;
+    let mut next_step = 0;
     loop {
         let wait = if finished {
             DRAIN_TIME
@@ -546,13 +622,14 @@ fn collect(
                     Some(typing) => crashed || typing.until.iter().all(|until| log.contains(until)),
                     None => FINAL_LINES.iter().any(|end| line.contains(end)),
                 };
-                if let Some(typing) = typing
-                    && !typed
-                    && line.contains(typing.after)
+                if let Some(step) = typing.and_then(|typing| typing.steps.get(next_step))
+                    && line.contains(step.after)
                 {
-                    console.write_all(typing.keys.as_bytes())?;
+                    // QEMU's output keeps coming meanwhile: the reader thread queues it.
+                    std::thread::sleep(step.delay);
+                    console.write_all(step.keys.as_bytes())?;
                     console.flush()?;
-                    typed = true;
+                    next_step += 1;
                 }
             }
             // QEMU exited (e.g. a triple fault with `-no-reboot`): the log is complete.

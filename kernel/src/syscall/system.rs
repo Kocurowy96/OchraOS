@@ -3,26 +3,31 @@
 //! Syscalls about the system as a whole: its name and the clocks.
 
 use super::{SyscallResult, read_user, write_user};
-use crate::errno::{EFAULT, EINTR, EINVAL, ERESTARTSYS, Errno};
+use crate::errno::{
+    EFAULT, EINTR, EINVAL, ERESTART_RESTARTBLOCK, ERESTARTNOHAND, ERESTARTSYS, Errno,
+};
+use crate::signal::RestartBlock;
 use crate::time::{self, NANOSECONDS_PER_SECOND};
 
 /// The Linux release whose syscall interface OchraOS aims at (the "ABI target", see
 /// `docs/architecture.md`). Programs and C libraries read it to decide what they may use
 /// (glibc refuses kernels older than it was built for), so it is a Linux version, marked as
 /// ours by the suffix.
-const ABI_TARGET_RELEASE: &str = "6.12.0-ochra";
+pub const ABI_TARGET_RELEASE: &str = "6.12.0-ochra";
+
+/// The kernel's own name and version (`uname -v`, `/proc/version`).
+pub const VERSION: &str = concat!("OchraOS ", env!("CARGO_PKG_VERSION"));
 
 /// `uname(buf)`: `struct utsname`, six NUL-terminated fields of 65 bytes. The system name is
 /// "Linux", as programs expect of a Linux ABI; the version field says what really runs.
 /// The host and domain names are "(none)", as in Linux until something sets them.
 pub fn uname(buffer: u64) -> SyscallResult {
     const FIELD: usize = 65;
-    let version = concat!("OchraOS ", env!("CARGO_PKG_VERSION"));
     let fields = [
         "Linux",
         "(none)",
         ABI_TARGET_RELEASE,
-        version,
+        VERSION,
         "x86_64",
         "(none)",
     ];
@@ -146,15 +151,48 @@ pub fn clock_nanosleep(id: u64, flags: u64, request: u64, remaining: u64) -> Sys
         duration
     };
     let deadline = time::monotonic().saturating_add(wait);
+    if absolute {
+        // The same deadline again, whenever it restarts.
+        return match time::sleep_until(deadline) {
+            Err(ERESTARTSYS) => Err(ERESTARTNOHAND),
+            result => result.map(|()| 0),
+        };
+    }
+    sleep_relative(deadline, remaining)
+}
+
+/// A relative sleep until `deadline`. Interrupted, it writes the time left to `remaining`
+/// and leaves the deadline for `restart_syscall`: a stop signal (Ctrl-Z) and `SIGCONT`, or
+/// a signal without a handler, do not cut the sleep short (Linux's `hrtimer_nanosleep`).
+fn sleep_relative(deadline: u64, remaining: u64) -> SyscallResult {
     match time::sleep_until(deadline) {
         Ok(()) => Ok(0),
         Err(ERESTARTSYS) => {
-            if !absolute && remaining != 0 {
+            if remaining != 0 {
                 let left = deadline.saturating_sub(time::monotonic());
                 write_user(remaining, &timespec(left)).map_err(|_| EFAULT)?;
             }
-            Err(EINTR)
+            let process = crate::process::current().ok_or(EINTR)?;
+            process.signals.lock().restart_block = Some(RestartBlock::Sleep {
+                deadline,
+                remaining,
+            });
+            Err(ERESTART_RESTARTBLOCK)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// `restart_syscall()`: goes on with the syscall a signal interrupted (the kernel makes the
+/// program call it; programs never do). Without a saved restart block, `EINTR`.
+pub fn restart_syscall() -> SyscallResult {
+    let process = crate::process::current().ok_or(EINTR)?;
+    let block = process.signals.lock().restart_block.take();
+    match block {
+        Some(RestartBlock::Sleep {
+            deadline,
+            remaining,
+        }) => sleep_relative(deadline, remaining),
+        None => Err(EINTR),
     }
 }

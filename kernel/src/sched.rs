@@ -286,6 +286,10 @@ impl WaitQueue {
         })
     }
 
+    fn register(&self, task: &Arc<Task>) {
+        self.waiters.lock().push(task.clone());
+    }
+
     /// Wakes every waiter.
     pub fn wake_all(&self) {
         let waiters = core::mem::take(&mut *self.waiters.lock());
@@ -299,6 +303,46 @@ impl WaitQueue {
             .lock()
             .retain(|waiter| !Arc::ptr_eq(waiter, task));
     }
+}
+
+/// Blocks until `ready` returns `Some`, waiting in all of `queues` at once (`poll`, a read
+/// with a timeout): a wake-up from any of them makes `ready` run again.
+///
+/// The task is registered in every queue *before* `ready` runs, so an event that comes
+/// while the registration goes on is never lost: either `ready` sees it, or the event's
+/// `wake_all` finds the task in its queue and cancels the sleep.
+pub fn wait_any<T>(queues: &[&WaitQueue], mut ready: impl FnMut() -> Option<T>) -> T {
+    let current = task::current().expect("only tasks wait");
+    loop {
+        for queue in queues {
+            queue.register(&current);
+        }
+        prepare_sleep(&current);
+        let value = ready();
+        if value.is_some() {
+            cancel_sleep(&current);
+        } else {
+            block(&current);
+        }
+        for queue in queues {
+            queue.remove(&current);
+        }
+        if let Some(value) = value {
+            return value;
+        }
+    }
+}
+
+/// Like [`wait_any`], but gives up with `ERESTARTSYS` when a signal is to be delivered.
+pub fn wait_any_interruptible<T>(
+    queues: &[&WaitQueue],
+    mut ready: impl FnMut() -> Option<T>,
+) -> Result<T, Errno> {
+    wait_any(queues, || match ready() {
+        Some(value) => Some(Ok(value)),
+        None if crate::signal::interrupted() => Some(Err(ERESTARTSYS)),
+        None => None,
+    })
 }
 
 /// A lock for work that may block (disk I/O, waiting for a page): a task that finds it taken

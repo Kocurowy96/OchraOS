@@ -20,10 +20,15 @@
 //! syscall then returns `ERESTARTSYS` or similar, and `on_return` decides: run it again
 //! (no handler, or the handler has `SA_RESTART`) or fail with `EINTR`.
 //!
+//! Job control (sessions and process groups: `man 7 credentials`): a stop signal
+//! (`SIGSTOP`, or `SIGTSTP`/`SIGTTIN`/`SIGTTOU` without a handler) stops the process until
+//! `SIGCONT`; its parent learns both through `SIGCHLD` and `wait4`. `SIGCONT` and the stop
+//! signals act when they are *sent*: `SIGCONT` resumes the process at once and drops pending
+//! stop signals, and a stop signal drops a pending `SIGCONT`.
+//!
 //! Simplifications for now: standard signals and real-time signals (32–64) are both
-//! "one pending at a time" (Linux queues real-time ones); there is no job control (stop
-//! signals are ignored by default), no `sigaltstack`, and every process may signal every
-//! other (there are no users yet).
+//! "one pending at a time" (Linux queues real-time ones); no `sigaltstack`; every process may
+//! signal every other (there are no users yet).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -32,10 +37,14 @@ use alloc::vec;
 use ochra_frame::task;
 use ochra_frame::user_mode::{Registers, UserContext, UserFault};
 
-use crate::errno::{EFAULT, EINTR, ERESTARTNOHAND, ERESTARTNOINTR, ERESTARTSYS, Errno};
+use crate::errno::{
+    EFAULT, EINTR, ERESTART_RESTARTBLOCK, ERESTARTNOHAND, ERESTARTNOINTR, ERESTARTSYS, Errno,
+};
 use crate::process::{self, Exit, Process};
 use crate::syscall::{read_user, write_user};
 
+pub const SIGHUP: u8 = 1;
+pub const SIGINT: u8 = 2;
 pub const SIGQUIT: u8 = 3;
 pub const SIGILL: u8 = 4;
 pub const SIGTRAP: u8 = 5;
@@ -73,6 +82,8 @@ pub const SIG_IGN: u64 = 1;
 
 /// `sa_flags` bits (`include/uapi/asm-generic/signal-defs.h`, x86's `SA_RESTORER`).
 pub mod flags {
+    /// No `SIGCHLD` when a child stops or continues.
+    pub const SA_NOCLDSTOP: u64 = 1;
     pub const SA_NOCLDWAIT: u64 = 2;
     pub const SA_RESTORER: u64 = 0x0400_0000;
     pub const SA_RESTART: u64 = 0x1000_0000;
@@ -91,6 +102,14 @@ pub struct Action {
     pub mask: u64,
 }
 
+/// What an interrupted syscall left for `restart_syscall` to go on with.
+#[derive(Clone, Copy, Debug)]
+pub enum RestartBlock {
+    /// A relative `nanosleep`/`clock_nanosleep`: sleep until `deadline` (monotonic), and
+    /// write the time left to `remaining` (if not 0) if interrupted again.
+    Sleep { deadline: u64, remaining: u64 },
+}
+
 /// What the default action does with a signal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Default {
@@ -98,7 +117,7 @@ enum Default {
     /// Terminate with a core dump in Linux; there are no core dumps here.
     Core,
     Ignore,
-    /// Job control: stop the process. Ignored until there is job control.
+    /// Job control: stop the process until `SIGCONT`.
     Stop,
 }
 
@@ -135,6 +154,8 @@ pub mod code {
     pub const SI_KERNEL: i32 = 0x80;
     pub const CLD_EXITED: i32 = 1;
     pub const CLD_KILLED: i32 = 2;
+    pub const CLD_STOPPED: i32 = 5;
+    pub const CLD_CONTINUED: i32 = 6;
     pub const SEGV_MAPERR: i32 = 1;
     pub const SEGV_ACCERR: i32 = 2;
 }
@@ -183,6 +204,9 @@ pub struct Signals {
     /// The syscall that just returned a restart code (`ERESTARTSYS`…), by number; set by the
     /// syscall dispatcher, taken by `on_return` before going back to the program.
     pub restart: Option<u64>,
+    /// How `restart_syscall` goes on with a syscall that returned `ERESTART_RESTARTBLOCK`
+    /// (Linux's `restart_block`).
+    pub restart_block: Option<RestartBlock>,
     /// The mask to restore after a handler started by `rt_sigsuspend` (which runs with a
     /// temporary mask).
     pub saved_mask: Option<u64>,
@@ -196,6 +220,7 @@ impl Signals {
             pending: 0,
             info: vec![None; usize::from(MAX_SIGNAL)].into_boxed_slice(),
             restart: None,
+            restart_block: None,
             saved_mask: None,
         }
     }
@@ -238,11 +263,25 @@ impl Signals {
         self.pending & self.blocked
     }
 
+    /// For `/proc/<pid>/status`: pending, blocked, ignored (`SIG_IGN`) and caught (with a
+    /// handler) signals, as bit masks (bit `n - 1` for signal `n`).
+    pub fn masks(&self) -> [u64; 4] {
+        let (mut ignored, mut caught) = (0, 0);
+        for (index, action) in self.actions.iter().enumerate() {
+            match action.handler {
+                SIG_DFL => {}
+                SIG_IGN => ignored |= 1 << index,
+                _ => caught |= 1 << index,
+            }
+        }
+        [self.pending, self.blocked, ignored, caught]
+    }
+
     /// Whether the action for `signal` is to ignore it.
     fn ignores(&self, signal: u8) -> bool {
         match self.action(signal).handler {
             SIG_IGN => true,
-            SIG_DFL => matches!(default_action(signal), Default::Ignore | Default::Stop),
+            SIG_DFL => default_action(signal) == Default::Ignore,
             _ => false,
         }
     }
@@ -252,6 +291,17 @@ impl Signals {
     pub fn reaps_children(&self) -> bool {
         let action = self.action(SIGCHLD);
         action.handler == SIG_IGN || action.flags & flags::SA_NOCLDWAIT != 0
+    }
+
+    /// Whether `signal` is blocked or ignored: then a terminal does not stop a background
+    /// process with it (Linux's `is_ignored` in `tty_check_change`).
+    pub fn blocks_or_ignores(&self, signal: u8) -> bool {
+        self.blocked & bit(signal) != 0 || self.action(signal).handler == SIG_IGN
+    }
+
+    /// Whether `SIGKILL` is pending: it ends a stop.
+    pub fn kill_pending(&self) -> bool {
+        self.pending & bit(SIGKILL) != 0
     }
 
     fn discard(&mut self, signal: u8) {
@@ -288,6 +338,18 @@ pub fn send(process: &Process, signal: u8, info: Info) {
     if process.exit().is_some() {
         return;
     }
+    // Job control happens when the signal is sent, even if it is blocked or ignored.
+    if signal == SIGCONT {
+        {
+            let mut signals = process.signals.lock();
+            for stop in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU] {
+                signals.discard(stop);
+            }
+        }
+        process::resume(process);
+    } else if is_stop(signal) {
+        process.signals.lock().discard(SIGCONT);
+    }
     let wake = {
         let mut signals = process.signals.lock();
         let blocked = signals.blocked & bit(signal) != 0;
@@ -305,6 +367,27 @@ pub fn send(process: &Process, signal: u8, info: Info) {
     // when it next returns to user mode, at the latest after one timer tick.
     if wake && let Some(task) = process.task() {
         crate::sched::wake(&task);
+    }
+}
+
+fn is_stop(signal: u8) -> bool {
+    matches!(signal, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
+}
+
+/// Sends `signal` to every process in process group `group`; whether there was one.
+pub fn send_to_group(group: u32, signal: u8, info: Info) -> bool {
+    let members = process::matching(|target| process::group(target) == group);
+    for member in &members {
+        send(member, signal, info);
+    }
+    !members.is_empty()
+}
+
+/// A signal the kernel sends on its own account (a terminal's `SIGINT`, a hangup).
+pub fn from_kernel() -> Info {
+    Info::Sent {
+        code: code::SI_KERNEL,
+        sender: 0,
     }
 }
 
@@ -371,7 +454,16 @@ pub fn on_return(context: &mut UserContext) {
         match action.handler {
             SIG_IGN => continue,
             SIG_DFL => match default_action(signal) {
-                Default::Ignore | Default::Stop => continue,
+                Default::Ignore => continue,
+                Default::Stop => {
+                    // Stopping a group nobody outside it can continue would leave it stuck,
+                    // so only `SIGSTOP` stops an orphaned group (POSIX).
+                    let group = process::group(&process);
+                    if signal == SIGSTOP || !process::is_orphaned_group(group, None) {
+                        process::stop(&process, signal);
+                    }
+                    continue;
+                }
                 Default::Terminate | Default::Core => process::exit(process, Exit::Signal(signal)),
             },
             _ => {}
@@ -389,6 +481,8 @@ pub fn on_return(context: &mut UserContext) {
         }
         let mut signals = process.signals.lock();
         signals.saved_mask = None;
+        // A handler ran: the interrupted syscall failed with `EINTR`, nothing to go on with.
+        signals.restart_block = None;
         signals.blocked |= action.mask;
         if action.flags & flags::SA_NODEFER == 0 {
             signals.blocked |= bit(signal);
@@ -414,15 +508,22 @@ pub fn on_return(context: &mut UserContext) {
 /// `handler_flags` is `None` when no handler runs.
 fn finish_syscall(context: &mut UserContext, number: u64, handler_flags: Option<u64>) {
     let code = -(context.registers().rax as i64);
+    /// `restart_syscall`, which continues from the restart block.
+    const RESTART_SYSCALL: u64 = 219;
     let fail = match (code, handler_flags) {
         (ERESTARTNOINTR, _) | (_, None) => false,
         (ERESTARTSYS, Some(flags)) => flags & flags::SA_RESTART == 0,
-        (ERESTARTNOHAND, Some(_)) => true,
+        (ERESTARTNOHAND | ERESTART_RESTARTBLOCK, Some(_)) => true,
         _ => return,
     };
     if fail {
         context.set_result((-EINTR) as u64);
     } else {
+        let number = if code == ERESTART_RESTARTBLOCK {
+            RESTART_SYSCALL
+        } else {
+            number
+        };
         context.set_result(number);
         context.set_instruction_pointer(context.instruction_pointer() - 2);
     }
@@ -580,6 +681,19 @@ fn bad_frame(process: &Process) -> Errno {
     };
     force(process, SIGSEGV, info);
     EFAULT
+}
+
+/// The `SIGCHLD` information for a child that stopped (`signal`) or continued (`None`).
+pub fn child_stopped(child: u32, signal: Option<u8>) -> Info {
+    let (code, status) = match signal {
+        Some(signal) => (code::CLD_STOPPED, i32::from(signal)),
+        None => (code::CLD_CONTINUED, i32::from(SIGCONT)),
+    };
+    Info::Child {
+        code,
+        child,
+        status,
+    }
 }
 
 /// The `si_code` of a `SIGCHLD` and the status for a child that ended with `exit`.

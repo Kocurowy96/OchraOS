@@ -14,9 +14,10 @@ use core::any::Any;
 
 use ochra_frame::mm::frames::Frame;
 
-use super::PageCache;
 use super::mode;
+use super::{PageCache, Path};
 use crate::errno::{EINVAL, ENOTDIR, EPERM, Errno};
+use crate::file::File;
 
 /// A point in time: seconds and nanoseconds since 1970 (UTC).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -150,6 +151,13 @@ pub trait Inode: Send + Sync {
         Err(ENOTDIR)
     }
 
+    /// Whether the VFS may keep this directory's entries in its dentry cache. A filesystem
+    /// whose entries come and go by themselves (a process in `/proc`, a pty in `/dev/pts`)
+    /// says no, and every walk asks it again (Linux's `d_revalidate`).
+    fn caches_lookups(&self) -> bool {
+        true
+    }
+
     /// Creates `name` in this directory, with the given mode bits (permissions; the type comes
     /// from `node`) and owner.
     fn create(
@@ -192,6 +200,12 @@ pub trait Inode: Send + Sync {
     /// A symbolic link's target.
     fn readlink(&self) -> Result<String, Errno> {
         Err(EINVAL)
+    }
+
+    /// For filesystems that make their own open files (procfs): the file for an `open` of
+    /// this inode at `path`. `None` (the default) lets the VFS open it as usual.
+    fn open(&self, _path: &Path, _access_mode: u32) -> Option<Result<Arc<dyn File>, Errno>> {
+        None
     }
 
     /// A regular file's cached pages.

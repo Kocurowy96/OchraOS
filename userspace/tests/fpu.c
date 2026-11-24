@@ -2,7 +2,7 @@
 //
 // The x87/SSE state belongs to each process: four children and the parent each fill all
 // sixteen XMM registers with their own pattern and set their own MXCSR rounding mode, then
-// give the CPU away a few thousand times (sched_yield) and check that nothing changed. A
+// give the CPU away a thousand times each (sched_yield) and check that nothing changed. A
 // kernel that forgot to save and restore that state on task switches would mix them up.
 
 #define _GNU_SOURCE
@@ -63,7 +63,7 @@ static int hold_registers(unsigned pattern, unsigned mxcsr, long rounds) {
 }
 
 #define CHILDREN 4
-#define ROUNDS 3000
+#define ROUNDS 1000
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);

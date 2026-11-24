@@ -100,9 +100,10 @@ Checklist:
       `getdents64`; `/dev` (`null`, `zero`, `full`, `random`, `urandom`, `console`, `tty`);
       wall clock from the RTC, `CLOCK_MONOTONIC` from the TSC (constant rate checked
       through CPUID), `clock_gettime`, `gettimeofday`, `nanosleep`
-- [ ] P2: TTY with termios (canonical and raw mode, echo, Ctrl-C/Ctrl-Z/Ctrl-\\), sessions
-      and process groups, stopping and continuing processes, `poll`; ash with line editing
-      and job control; minimal `/proc` and `/sys`
+- [x] P2: TTY with termios (canonical and raw mode, echo, Ctrl-C/Ctrl-Z/Ctrl-\\) on the
+      serial console and on pseudo-terminals (`/dev/ptmx`, devpts), sessions and process
+      groups, stopping and continuing processes, `poll`, `ppoll`, `select`, `pselect6`;
+      ash with line editing and job control; minimal `/proc` and `/sys`
 - [ ] P3: PCI (ACPI MCFG, ECAM), NVMe (polling, then MSI-X), block cache, GPT; AHCI; disk
       images made by `cargo xtask` without root (`mkfs.ext4 -d`)
 - [ ] P4: ext2 (read and write), then ext4 (extents, 64bit, flex_bg, metadata checksums),
@@ -129,11 +130,23 @@ Framebuffer, DRM via virtio-gpu, evdev, logind-compatible session service.
 
 **Done when:** a Wayland compositor shows a window.
 
+Test desktops before OchraWM: each rung is an existing desktop that has to run before the
+next one, and tests a part of the system OchraWM will need:
+
+1. **weston, then sway**: DRM/KMS, evdev input, shared memory between client and compositor
+   (`memfd`, `mmap` of shared buffers), the Wayland protocol over Unix sockets.
+
 ## Stage 7 — Desktop applications
 
 Wine, audio (PipeWire), USB, Arch packages, A/B updates, installer, Ochra Welcome.
 
 **Done when:** a simple Windows program runs through Wine.
+
+The test desktop ladder continues (rung 1 is in stage 6), then OchraWM:
+
+2. **XFCE**: X11 through Xorg and XWayland, the path Steam and Wine take.
+3. **KDE Plasma**: D-Bus and system services, Qt, and performance under a large desktop.
+4. **OchraWM**: the own compositor, on a base the three rungs above have checked.
 
 ## Stage 8 — Real hardware and GPU
 

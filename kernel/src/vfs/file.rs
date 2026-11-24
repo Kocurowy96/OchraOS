@@ -317,8 +317,16 @@ impl File for DeviceNode {
         self.access_mode
     }
 
-    fn is_terminal(&self) -> bool {
-        self.device.is_terminal()
+    fn ioctl(&self, request: u64, argument: u64) -> Result<u64, Errno> {
+        self.device.ioctl(request, argument)
+    }
+
+    fn poll(&self) -> u32 {
+        self.device.poll()
+    }
+
+    fn wait_queues<'a>(&'a self, queues: &mut Vec<&'a crate::sched::WaitQueue>) {
+        self.device.wait_queues(queues);
     }
 
     fn stat(&self) -> Metadata {

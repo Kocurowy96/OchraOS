@@ -174,3 +174,57 @@ pub(crate) unsafe fn write_msr(msr: u32, value: u64) {
              options(nostack, preserves_flags));
     }
 }
+
+/// What the CPU says about itself (`/proc/cpuinfo`).
+#[derive(Clone, Copy, Debug)]
+pub struct Identity {
+    /// E.g. `GenuineIntel`, `AuthenticAMD` (CPUID leaf 0).
+    pub vendor: [u8; 12],
+    /// The model name, padded with spaces or NULs (leaves 0x8000_0002..=0x8000_0004); empty
+    /// on CPUs without those leaves.
+    pub brand: [u8; 48],
+    pub family: u32,
+    pub model: u32,
+    pub stepping: u32,
+}
+
+/// Reads the vendor, the model name and the family/model/stepping numbers, combined the way
+/// Intel and AMD document it (the extended fields count only for families 6 and 15).
+pub fn identity() -> Identity {
+    use core::arch::x86_64::__cpuid;
+    let leaf0 = __cpuid(0);
+    let mut vendor = [0; 12];
+    for (index, register) in [leaf0.ebx, leaf0.edx, leaf0.ecx].into_iter().enumerate() {
+        vendor[index * 4..][..4].copy_from_slice(&register.to_le_bytes());
+    }
+    let signature = __cpuid(1).eax;
+    let base_family = (signature >> 8) & 0xf;
+    let base_model = (signature >> 4) & 0xf;
+    let family = match base_family {
+        15 => base_family + ((signature >> 20) & 0xff),
+        _ => base_family,
+    };
+    let model = match base_family {
+        6 | 15 => base_model + ((signature >> 12) & 0xf0),
+        _ => base_model,
+    };
+    let mut brand = [0; 48];
+    if __cpuid(0x8000_0000).eax >= 0x8000_0004 {
+        for (index, leaf) in (0x8000_0002..=0x8000_0004u32).enumerate() {
+            let registers = __cpuid(leaf);
+            for (part, register) in [registers.eax, registers.ebx, registers.ecx, registers.edx]
+                .into_iter()
+                .enumerate()
+            {
+                brand[index * 16 + part * 4..][..4].copy_from_slice(&register.to_le_bytes());
+            }
+        }
+    }
+    Identity {
+        vendor,
+        brand,
+        family,
+        model,
+        stepping: signature & 0xf,
+    }
+}
